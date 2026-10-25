@@ -256,3 +256,49 @@ def test_failed(verdicts, fail_on, expected):
 
 def test_marker_matches_the_api():
     assert gitlab.MARKER == "<!-- depdelta:review -->"
+
+
+def _blocked(blocked: bool = True, notes: list | None = None):
+    return ok(
+        {
+            "data": {
+                "status": "ready",
+                "label": "🟢 Safe",
+                "body": "### DepDelta review",
+                "verdict": "safe",
+                "updates": [],
+                "blocked": blocked,
+                "notes": notes or [],
+            }
+        }
+    )
+
+
+def test_run_sends_the_config_and_blocks(repo, commit, monkeypatch, capsys):
+    base = commit({"package.json": '{"dependencies": {}}'})
+    head = commit(
+        {
+            "package.json": '{"dependencies": {"runner": "1.0.0"}}',
+            ".depdelta.yml": "install_scripts: block\nextra: [\n",
+        }
+    )
+    fake = FakeWeb(_blocked(notes=["not valid YAML; using the defaults"]))
+    monkeypatch.setattr(web, "request", fake)
+
+    code = run(["--repo", str(repo), "--base", base, "--head", head], KEY)
+
+    assert code == 1
+    assert fake.calls[0]["body"]["config"] == "install_scripts: block\nextra: [\n"
+    err = capsys.readouterr().err
+    assert ".depdelta.yml: not valid YAML; using the defaults." in err
+    assert "sets install_scripts: block" in err
+
+
+def test_run_not_blocked_passes(repo, commit, monkeypatch):
+    base = commit({"package.json": '{"dependencies": {}}'})
+    head = commit({"package.json": '{"dependencies": {"runner": "1.0.0"}}'})
+    fake = FakeWeb(_blocked(blocked=False))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo), "--base", base, "--head", head], KEY) == 0
+    assert "config" not in fake.calls[0]["body"]

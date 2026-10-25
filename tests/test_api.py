@@ -160,3 +160,31 @@ def test_review_gives_up_waiting(monkeypatch, clock):
     assert got.status == "indexing"
     assert clock.slept == [20]
     assert len(fake.calls) == 2
+
+
+def test_ask_sends_the_config(monkeypatch, clock):
+    data = {
+        "status": "ready",
+        "label": "x",
+        "body": "b",
+        "blocked": True,
+        "notes": ["install_scripts must be off, warn or block; using warn"],
+    }
+    fake = FakeWeb(ok({"data": data}))
+    monkeypatch.setattr(web, "request", fake)
+
+    got = client(clock).ask(FILES, config="install_scripts: block\n")
+
+    assert fake.calls[0]["body"]["config"] == "install_scripts: block\n"
+    assert got.blocked is True
+    assert got.notes == ("install_scripts must be off, warn or block; using warn",)
+
+
+def test_ask_without_config_sends_none(monkeypatch, clock):
+    fake = FakeWeb(review())
+    monkeypatch.setattr(web, "request", fake)
+
+    got = client(clock).ask(FILES)
+
+    assert "config" not in fake.calls[0]["body"]
+    assert (got.blocked, got.notes) == (False, ())

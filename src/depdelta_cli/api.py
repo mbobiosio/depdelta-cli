@@ -32,6 +32,10 @@ class Review:
     retry_after: int | None
     verdict: str | None
     updates: list[dict]
+    #: `.depdelta.yml` sets install_scripts: block and something is flagged.
+    blocked: bool = False
+    #: What was wrong with `.depdelta.yml`, one line each.
+    notes: tuple[str, ...] = ()
 
 
 def _message(body: object) -> str:
@@ -60,6 +64,8 @@ def _review(data: dict) -> Review:
         retry_after=data.get("retry_after"),
         verdict=data.get("verdict"),
         updates=list(data.get("updates") or []),
+        blocked=data.get("blocked") is True,
+        notes=tuple(str(n) for n in data.get("notes") or ()),
     )
 
 
@@ -84,6 +90,7 @@ class DepDelta:
         usage: list[dict] | None = None,
         fmt: str = "markdown",
         source_url: str | None = None,
+        config: str | None = None,
     ) -> Review:
         """One ask; server errors and network failures are tried again."""
         payload: dict = {
@@ -93,6 +100,8 @@ class DepDelta:
         }
         if source_url:
             payload["source_url"] = source_url
+        if config is not None:
+            payload["config"] = config
         for attempt in range(1, ATTEMPTS + 1):
             try:
                 reply = web.request(
@@ -127,13 +136,16 @@ class DepDelta:
         usage: list[dict] | None = None,
         fmt: str = "markdown",
         source_url: str | None = None,
+        config: str | None = None,
         wait: float = 300,
     ) -> Review:
         """Ask until the review is ready or ``wait`` seconds pass; then the
         last answer (still `indexing`) is the review."""
         deadline = self.clock() + wait
         while True:
-            review = self.ask(files, usage=usage, fmt=fmt, source_url=source_url)
+            review = self.ask(
+                files, usage=usage, fmt=fmt, source_url=source_url, config=config
+            )
             if review.status != "indexing":
                 return review
             pause = review.retry_after or POLL_SECONDS

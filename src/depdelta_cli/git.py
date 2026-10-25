@@ -52,6 +52,19 @@ def _show(repo: str, rev: str, path: str) -> str | None:
     return result.stdout.decode("utf-8", "replace")
 
 
+#: The repository's DepDelta settings, read at the change's head.
+CONFIG_PATH = ".depdelta.yml"
+#: DepDelta reads at most this much of it; past it, sending one character
+#: more is enough for the review to say the file is too big.
+MAX_CONFIG = 16 * 1024
+
+
+def config_file(repo: str, head: str) -> str | None:
+    """The `.depdelta.yml` text at ``head``, or None when there's none."""
+    text = _show(repo, head, CONFIG_PATH)
+    return text[: MAX_CONFIG + 1] if text is not None else None
+
+
 def changed_manifests(repo: str, base: str, head: str) -> list[ChangedFile]:
     """The manifests and lockfiles the change touched, at both ends."""
     names = _out(repo, "diff", "--name-only", "--no-renames", base, head, "--")

@@ -8,6 +8,7 @@ from depdelta_cli.git import (
     GitError,
     SourceFiles,
     changed_manifests,
+    config_file,
     ensure_commit,
     source_files,
 )
@@ -117,3 +118,21 @@ def test_source_files_not_a_repository(tmp_path):
 
 def test_show_missing_file(repo):
     assert module._show(str(repo), "HEAD", "nope") is None
+
+
+def test_config_file_success(repo, commit):
+    head = commit({".depdelta.yml": "install_scripts: block\n"})
+
+    assert config_file(str(repo), head) == "install_scripts: block\n"
+
+
+def test_config_file_missing(repo, commit):
+    assert config_file(str(repo), commit({"a.ts": "1"})) is None
+
+
+def test_config_file_cut_past_the_limit(repo, commit, monkeypatch):
+    monkeypatch.setattr(module, "MAX_CONFIG", 4)
+    head = commit({".depdelta.yml": "abcdefgh"})
+
+    # One character more than DepDelta reads: enough for it to say so.
+    assert config_file(str(repo), head) == "abcde"

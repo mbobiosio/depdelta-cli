@@ -1,6 +1,6 @@
 [project]
 name = "depdelta-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "DepDelta for CI: review a change's dependency updates on Gerrit or GitLab."
 readme = "README.md"
 license = "MIT"

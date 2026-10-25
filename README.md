@@ -33,6 +33,12 @@ On every change that touches a manifest or lockfile, `depdelta`:
    request note that later pipelines edit in place. Each update links to its
    full comparison on depdelta.com.
 
+Beyond each update, the review says what the change does to your lockfiles:
+packages before and after, new and removed direct dependencies (dev or
+production, and what each pulls in), and packages that newly run code at
+install time (an npm install script, a Python package built from source, a
+Composer plugin, a Cargo build script).
+
 Nine ecosystems: npm, PyPI, Maven, Composer, Cargo, RubyGems, pub.dev,
 NuGet and Go. Needs Python 3.11+ and git, nothing else.
 
@@ -137,7 +143,28 @@ depdelta [--repo .] [--base REV --head REV] [--print]
 - `--fail-on breaking` exits 1 when an update is breaking, to fail the job.
 
 Exit status: 0 posted (or nothing to review), 1 the `--fail-on` verdict was
-met, 2 it couldn't review or post.
+met or `.depdelta.yml` blocks new install-time code, 2 it couldn't review or
+post.
+
+## .depdelta.yml
+
+An optional file at the repository root, read at the change's head commit.
+The GitHub app reads the same file.
+
+```yaml
+install_scripts: warn        # off | warn (default) | block
+allow_install_scripts:       # never flagged
+  - esbuild
+  - sharp
+```
+
+- `warn` flags each package that newly runs code at install.
+- `block` flags them too, and `depdelta` exits 1, so the job fails until the
+  package is allowed or removed.
+- `off` leaves install-time code out of the review.
+
+`depdelta` sends the file as it is; DepDelta reads it. A file it can't read
+falls back to the defaults, and the review says why.
 
 ## Privacy
 

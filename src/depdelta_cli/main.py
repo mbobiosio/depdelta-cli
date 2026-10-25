@@ -9,8 +9,12 @@
 #   3. The command looks for those in the checkout and sends what it found;
 #      the review then says where the code is hit.
 #
+# The repository's `.depdelta.yml` (at the change's head) goes along as is:
+# DepDelta reads it, so this command needs no YAML parser.
+#
 # Exit status: 0 posted (or nothing to review), 1 the --fail-on verdict was
-# met, 2 it couldn't review or post.
+# met or `.depdelta.yml` blocks new install-time code, 2 it couldn't review
+# or post.
 
 import argparse
 import os
@@ -21,7 +25,13 @@ from depdelta_cli import __version__, check, gerrit, gitlab, web
 from depdelta_cli.api import DEFAULT_API_URL, ApiError, DepDelta, Review
 from depdelta_cli.env import Change, EnvError, GerritChange, GitLabMergeRequest
 from depdelta_cli.env import detect as detect_change
-from depdelta_cli.git import GitError, changed_manifests, ensure_commit, source_files
+from depdelta_cli.git import (
+    GitError,
+    changed_manifests,
+    config_file,
+    ensure_commit,
+    source_files,
+)
 
 #: depdelta-api pull_diff MAX_FILES: manifests reviewed per change.
 MAX_FILES = 40
@@ -96,17 +106,17 @@ def _review(
     files: list,
     fmt: str,
     source_url: str | None,
+    config: str | None,
 ) -> Review:
-    review = client.review(files, fmt=fmt, source_url=source_url, wait=args.wait)
+    options = {"fmt": fmt, "source_url": source_url, "config": config}
+    review = client.review(files, wait=args.wait, **options)
     wanted = check.ecosystems(review.updates)
     if not wanted:
         return review
     sources = source_files(args.repo, wanted)
     usage = check.usage(review.updates, sources)
     log(f"Usage check: {sum(u['total'] for u in usage)} uses found.")
-    return client.review(
-        files, usage=usage, fmt=fmt, source_url=source_url, wait=args.wait
-    )
+    return client.review(files, usage=usage, wait=args.wait, **options)
 
 
 def _post(change: Change, review: Review, env: Mapping[str, str]) -> None:
@@ -160,8 +170,11 @@ def run(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None)
             "text" if change and change.platform == "gerrit" else "markdown"
         )
         source_url = change.source_url if change else None
-        review = _review(DepDelta(key, api_url), args, files, fmt, source_url)
+        config = config_file(args.repo, head)
+        review = _review(DepDelta(key, api_url), args, files, fmt, source_url, config)
         log(f"{review.label} ({len(review.updates)} updates).")
+        for note in review.notes:
+            log(f".depdelta.yml: {note}.")
         if change is None or args.print_only:
             print(review.body)
         else:
@@ -177,6 +190,9 @@ def run(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None)
     ) as error:
         log(str(error))
         return 2
+    if review.blocked:
+        log("New install-time code, and .depdelta.yml sets install_scripts: block.")
+        return 1
     return 1 if failed(review, args.fail_on) else 0
 
 

@@ -23,6 +23,10 @@ MANIFEST_NAMES = frozenset(
         "gems.rb",
         "go.mod",
         "go.sum",
+        # Gradle dependency locking.
+        "gradle.lockfile",
+        "buildscript-gradle.lockfile",
+        "settings-gradle.lockfile",
         "libs.versions.toml",
         "npm-shrinkwrap.json",
         "package-lock.json",
@@ -37,6 +41,9 @@ MANIFEST_NAMES = frozenset(
         "pubspec.yaml",
         "pyproject.toml",
         "requirements.txt",
+        # pluginManagement { plugins { … } }: plugin versions.
+        "settings.gradle",
+        "settings.gradle.kts",
         "uv.lock",
         "yarn.lock",
     }

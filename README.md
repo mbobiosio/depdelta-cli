@@ -40,7 +40,11 @@ install time (an npm install script, a Python package built from source, a
 Composer plugin, a Cargo build script).
 
 Nine ecosystems: npm, PyPI, Maven, Composer, Cargo, RubyGems, pub.dev,
-NuGet and Go. Needs Python 3.11+ and git, nothing else.
+NuGet and Go. For Android and other Gradle builds that means
+`build.gradle(.kts)`, `settings.gradle(.kts)`, version catalogs
+(`gradle/libs.versions.toml`, libraries and plugins) and
+`gradle.lockfile`; plugins count as updates too (AGP, Kotlin, KSP, Hilt).
+Needs Python 3.11+ and git, nothing else.
 
 ```
 docker pull ghcr.io/mbobiosio/depdelta-cli:latest

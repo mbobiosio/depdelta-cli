@@ -17,9 +17,11 @@ On every change that touches a manifest or lockfile, `depdelta`:
 Nine ecosystems: npm, PyPI, Maven, Composer, Cargo, RubyGems, pub.dev,
 NuGet and Go. Needs Python 3.11+ and git, nothing else.
 
-Not published yet: build the image with `docker build -t depdelta-cli .` and
-push it to your registry, or `pip install .` from a checkout. The examples
-call the image `depdelta-cli`.
+```
+docker pull ghcr.io/mbobiosio/depdelta-cli:latest
+# or
+pip install depdelta-cli
+```
 
 ## API key
 
@@ -39,7 +41,7 @@ The checkout needs the patch set's parent: don't clone with depth 1 (or let
 
 ```groovy
 pipeline {
-  agent { docker { image 'depdelta-cli' } }
+  agent { docker { image 'ghcr.io/mbobiosio/depdelta-cli:latest' } }
   stages {
     stage('DepDelta') {
       steps {
@@ -60,7 +62,8 @@ pipeline {
 }
 ```
 
-Without Docker: install it on the agent, then the same `sh 'depdelta'`.
+Without Docker: `pip install depdelta-cli` on the agent, then the same
+`sh 'depdelta'`.
 
 `DEPDELTA_GERRIT_URL` overrides Gerrit's address when `GERRIT_CHANGE_URL`
 isn't the REST root (a proxy, a different host name for agents).
@@ -76,7 +79,7 @@ job a project access token with the `api` scope (Reporter role is enough) as
 
 ```yaml
 depdelta:
-  image: depdelta-cli
+  image: ghcr.io/mbobiosio/depdelta-cli:latest
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
@@ -116,6 +119,13 @@ depdelta [--repo .] [--base REV --head REV] [--print]
 Exit status: 0 posted (or nothing to review), 1 the `--fail-on` verdict was
 met, 2 it couldn't review or post.
 
+## Privacy
+
+Only the changed manifests and lockfiles leave CI, plus, for updates with
+removed or changed APIs, the path, line and symbol of each use found. The
+source code stays in CI. Gerrit and GitLab credentials are sent only to your
+Gerrit or GitLab.
+
 ## Development
 
 ```
@@ -126,3 +136,10 @@ make check format test
 `src/depdelta_cli/usage.py` is copied from depdelta-api
 (`app/updates/utils/usage.py`), and `manifests.py` follows its manifest
 names: change them there first, then here.
+
+Releases: bump `version` in `pyproject.toml`, then tag `v<version>` and
+push the tag. GitHub Actions publishes to PyPI and GHCR.
+
+## License
+
+MIT

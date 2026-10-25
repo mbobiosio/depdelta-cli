@@ -3,8 +3,26 @@ name = "depdelta-cli"
 version = "0.1.0"
 description = "DepDelta for CI: review a change's dependency updates on Gerrit or GitLab."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mbuodile Obiosio" }]
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["dependencies", "gerrit", "gitlab", "ci", "renovate", "breaking-changes"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://depdelta.com"
+Source = "https://github.com/mbobiosio/depdelta-cli"
+Issues = "https://github.com/mbobiosio/depdelta-cli/issues"
 
 [project.scripts]
 depdelta = "depdelta_cli.main:main"

@@ -21,6 +21,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://depdelta.com"
+Documentation = "https://depdelta.com/ci"
 Source = "https://github.com/mbobiosio/depdelta-cli"
 Issues = "https://github.com/mbobiosio/depdelta-cli/issues"
 

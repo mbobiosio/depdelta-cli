@@ -1,7 +1,25 @@
 # depdelta-cli
 
-DepDelta for CI on Gerrit and GitLab: the GitHub App's dependency review,
-posted on the change.
+[![PyPI](https://img.shields.io/pypi/v/depdelta-cli)](https://pypi.org/project/depdelta-cli/)
+[![CI](https://github.com/mbobiosio/depdelta-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/mbobiosio/depdelta-cli/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+Know what a dependency update breaks before you merge, on Gerrit and GitLab.
+
+[DepDelta](https://depdelta.com) reads every release's notes, security
+advisories and published API between two versions of a package, and says
+what changed and what will break: see
+[eslint 8.57.0 → 9.0.0](https://depdelta.com/npm/eslint/compare/8.57.0...9.0.0)
+for an example. `depdelta` brings that review to your CI. On every change that
+updates a dependency (from Renovate or anyone) it posts the breaking changes,
+security fixes, removed APIs and where your code uses them, right on the
+change.
+
+On GitHub, the [DepDelta GitHub app](https://depdelta.com/github-app) does
+this with no CI job. Setup guide, example review and FAQ:
+**[depdelta.com/ci](https://depdelta.com/ci)**.
+
+## How it works
 
 On every change that touches a manifest or lockfile, `depdelta`:
 
@@ -12,7 +30,8 @@ On every change that touches a manifest or lockfile, `depdelta`:
 3. looks for those declarations in the checkout, and sends only the hits
    (path, line, symbol);
 4. posts the review: a Gerrit change message (no vote), or one GitLab merge
-   request note that later pipelines edit in place.
+   request note that later pipelines edit in place. Each update links to its
+   full comparison on depdelta.com.
 
 Nine ecosystems: npm, PyPI, Maven, Composer, Cargo, RubyGems, pub.dev,
 NuGet and Go. Needs Python 3.11+ and git, nothing else.
@@ -25,9 +44,10 @@ pip install depdelta-cli
 
 ## API key
 
-Make one in DepDelta → Settings → API keys for CI, and store it in your CI's
-secrets as `DEPDELTA_API_KEY`. Each key gets 240 reviews an hour, waiting
-on release notes included.
+Sign in at [depdelta.com](https://depdelta.com) with GitHub or Google,
+make a key in [Settings → API keys for CI](https://depdelta.com/settings),
+and store it in your CI's secrets as `DEPDELTA_API_KEY`. Each key gets 240
+reviews an hour, waiting on release notes included.
 
 ## Jenkins with Gerrit Trigger
 
@@ -124,7 +144,16 @@ met, 2 it couldn't review or post.
 Only the changed manifests and lockfiles leave CI, plus, for updates with
 removed or changed APIs, the path, line and symbol of each use found. The
 source code stays in CI. Gerrit and GitLab credentials are sent only to your
-Gerrit or GitLab.
+Gerrit or GitLab. The [privacy policy](https://depdelta.com/privacy) has the
+details.
+
+## Links
+
+- Website: [depdelta.com](https://depdelta.com)
+- CI setup guide: [depdelta.com/ci](https://depdelta.com/ci)
+- GitHub app: [depdelta.com/github-app](https://depdelta.com/github-app)
+- Check a whole project's dependencies: [depdelta.com/report](https://depdelta.com/report)
+- Issues: [github.com/mbobiosio/depdelta-cli/issues](https://github.com/mbobiosio/depdelta-cli/issues)
 
 ## Development
 
@@ -133,9 +162,9 @@ uv sync
 make check format test
 ```
 
-`src/depdelta_cli/usage.py` is copied from depdelta-api
-(`app/updates/utils/usage.py`), and `manifests.py` follows its manifest
-names: change them there first, then here.
+`src/depdelta_cli/usage.py` is the same usage matcher the DepDelta service
+and GitHub app run, and `manifests.py` uses the same manifest names: changes
+to either start in the service, then are copied here.
 
 Releases: bump `version` in `pyproject.toml`, then tag `v<version>` and
 push the tag. GitHub Actions publishes to PyPI and GHCR.

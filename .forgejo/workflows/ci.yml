@@ -1,0 +1,39 @@
+name: depdelta-cli
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    name: Lint, types & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Sync dependencies
+        run: uv sync --frozen --python 3.13
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Ruff format check
+        run: uv run ruff format --check .
+      - name: Type check (pyright)
+        run: uv run pyright
+      - name: Tests (100% coverage)
+        run: uv run pytest
+
+  image:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: docker build -t depdelta-cli:ci .
+      - name: Smoke test
+        run: docker run --rm depdelta-cli:ci depdelta --version

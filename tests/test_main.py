@@ -1,0 +1,258 @@
+# tests/test_main.py
+
+import pytest
+from helpers import CLI_ENGINE, FakeWeb, ok, review, update
+
+from depdelta_cli import gitlab, main, web
+from depdelta_cli.api import DEFAULT_API_URL, _review
+from depdelta_cli.main import failed, run
+
+KEY = {"DEPDELTA_API_KEY": "dd_key"}
+
+
+@pytest.fixture
+def change(repo, commit):
+    """base → head bumps eslint; the code uses CLIEngine."""
+    base = commit({"package.json": '{"devDependencies": {"eslint": "8.57.0"}}'})
+    head = commit(
+        {
+            "package.json": '{"devDependencies": {"eslint": "9.0.0"}}',
+            "src/lint.ts": "import { CLIEngine } from 'eslint'\nnew CLIEngine()\n",
+        }
+    )
+    return base, head
+
+
+def gerrit_env(head: str) -> dict:
+    return {
+        **KEY,
+        "GERRIT_PROJECT": "web",
+        "GERRIT_CHANGE_NUMBER": "12",
+        "GERRIT_PATCHSET_REVISION": head,
+        "GERRIT_CHANGE_URL": "https://gerrit.test/c/web/+/12",
+        "GERRIT_HTTP_USER": "bot",
+        "GERRIT_HTTP_PASSWORD": "pw",
+    }
+
+
+def gitlab_env(base: str, head: str) -> dict:
+    return {
+        **KEY,
+        "GITLAB_CI": "true",
+        "CI_MERGE_REQUEST_IID": "7",
+        "CI_COMMIT_SHA": head,
+        "CI_MERGE_REQUEST_DIFF_BASE_SHA": base,
+        "CI_API_V4_URL": "https://gl.test/api/v4",
+        "CI_PROJECT_ID": "42",
+        "CI_PROJECT_URL": "https://gl.test/acme/web",
+        "GITLAB_TOKEN": "tok",
+    }
+
+
+def test_run_gerrit_success(repo, change, monkeypatch, capsys):
+    _, head = change
+    fake = FakeWeb(
+        review(updates=[update([CLI_ENGINE])]),
+        review(updates=[update([CLI_ENGINE])], body="DepDelta review: Breaking"),
+        ok({}),
+    )
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], gerrit_env(head)) == 0
+
+    first, second, posted = fake.calls
+    assert first["url"] == f"{DEFAULT_API_URL}/ci/reviews"
+    assert first["body"]["format"] == "text"
+    assert [f["path"] for f in first["body"]["files"]] == ["package.json"]
+    assert second["body"]["usage"][0]["hits"] == [
+        {"path": "src/lint.ts", "line": 2, "symbol": "CLIEngine", "change": "removed"}
+    ]
+    assert posted["url"] == (
+        f"https://gerrit.test/a/changes/web~12/revisions/{head}/review"
+    )
+    assert posted["body"]["message"] == "DepDelta review: Breaking"
+    err = capsys.readouterr().err
+    assert "Usage check: 1 uses found." in err
+    assert "Posted the review on the Gerrit change." in err
+
+
+def test_run_gitlab_success(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(review(updates=[update()]), ok([]), ok({"id": 1}, 201))
+    monkeypatch.setattr(web, "request", fake)
+
+    env = {**gitlab_env(base, head), "DEPDELTA_API_URL": "https://api.test/v1"}
+    assert run(["--repo", str(repo)], env) == 0
+
+    asked, _, added = fake.calls
+    assert asked["url"] == "https://api.test/v1/ci/reviews"
+    assert asked["body"]["format"] == "markdown"
+    assert asked["body"]["source_url"] == f"https://gl.test/acme/web/-/blob/{head}"
+    assert added["body"] == {"body": "### DepDelta review"}
+    assert "Review note added on the merge request." in capsys.readouterr().err
+
+
+def test_run_print_by_hand(repo, change, monkeypatch, capsys):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review(updates=[update()])))
+
+    code = run(
+        ["--repo", str(repo), "--base", base, "--head", head, "--format", "text"],
+        KEY,
+    )
+
+    assert code == 0
+    out = capsys.readouterr()
+    assert out.out == "### DepDelta review\n"
+    assert "🔴 Breaking (1 updates)." in out.err
+
+
+def test_run_print_in_ci(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(review())
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo), "--print"], gitlab_env(base, head)) == 0
+    assert len(fake.calls) == 1
+    assert capsys.readouterr().out == "### DepDelta review\n"
+
+
+def test_run_fail_on(repo, change, monkeypatch):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review(updates=[update()])))
+
+    args = ["--repo", str(repo), "--base", base, "--head", head]
+    assert run([*args, "--fail-on", "breaking"], KEY) == 1
+
+
+def test_run_nothing_to_review(repo, commit, monkeypatch, capsys):
+    base = commit({"a.ts": "1"})
+    head = commit({"a.ts": "2"})
+    monkeypatch.setattr(web, "request", FakeWeb())
+
+    assert run(["--repo", str(repo), "--base", base, "--head", head], {}) == 0
+    assert "nothing to review" in capsys.readouterr().err
+
+
+def test_run_caps_the_files(repo, commit, monkeypatch, capsys):
+    monkeypatch.setattr(main, "MAX_FILES", 1)
+    base = commit({})
+    head = commit({"a/package.json": "{}", "b/package.json": "{}"})
+    fake = FakeWeb(review())
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo), "--base", base, "--head", head], KEY) == 0
+    assert len(fake.calls[0]["body"]["files"]) == 1
+    assert "2 manifests changed; reviewing the first 1." in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("args", "env", "message"),
+    [
+        (["--base", "x"], {}, "Pass both --base and --head."),
+        ([], {}, "No change found"),
+    ],
+)
+def test_run_usage_errors(repo, args, env, message, capsys):
+    assert run(["--repo", str(repo), *args], env) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_run_without_a_key(repo, change, capsys):
+    base, head = change
+
+    assert run(["--repo", str(repo), "--base", base, "--head", head], {}) == 2
+    assert "Set DEPDELTA_API_KEY" in capsys.readouterr().err
+
+
+def test_run_gerrit_without_credentials(repo, change, monkeypatch, capsys):
+    _, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review()))
+    env = gerrit_env(head)
+    del env["GERRIT_HTTP_PASSWORD"]
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "Set GERRIT_HTTP_PASSWORD" in capsys.readouterr().err
+
+
+def test_run_gerrit_cuts_long_reviews(repo, change, monkeypatch):
+    _, head = change
+    monkeypatch.setattr(main.gerrit, "MAX_MESSAGE", 100)
+    fake = FakeWeb(review(updates=[update()], body="x" * 500), ok({}))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], gerrit_env(head)) == 0
+    message = fake.calls[1]["body"]["message"]
+    assert message.endswith(update()["url"])
+
+
+def test_run_gerrit_cut_without_updates(repo, change, monkeypatch):
+    _, head = change
+    monkeypatch.setattr(main.gerrit, "MAX_MESSAGE", 100)
+    fake = FakeWeb(review(body="x" * 500), ok({}))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], gerrit_env(head)) == 0
+    assert fake.calls[1]["body"]["message"].endswith("\n\n…")
+
+
+def test_run_gitlab_post_fails(repo, change, monkeypatch, capsys):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review(), ok({"message": "x"}, 401)))
+
+    assert run(["--repo", str(repo)], gitlab_env(base, head)) == 2
+    assert "GitLab answered 401" in capsys.readouterr().err
+
+
+def test_run_gitlab_without_token(repo, change, monkeypatch, capsys):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review()))
+    env = gitlab_env(base, head)
+    del env["GITLAB_TOKEN"]
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "Set GITLAB_TOKEN" in capsys.readouterr().err
+
+
+def test_run_network_failure_posting(repo, change, monkeypatch, capsys):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review(), web.HttpError("down")))
+
+    assert run(["--repo", str(repo)], gitlab_env(base, head)) == 2
+    assert "down" in capsys.readouterr().err
+
+
+def test_run_unknown_target(repo, change, monkeypatch):
+    # A Change for neither platform posts nothing.
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review()))
+    real = main.detect_change
+
+    def odd(env):
+        found = real(env)
+        return type(found)(found.platform, found.base, found.head, None, object())
+
+    monkeypatch.setattr(main, "detect_change", odd)
+
+    assert run(["--repo", str(repo)], gitlab_env(base, head)) == 0
+
+
+@pytest.mark.parametrize(
+    ("verdicts", "fail_on", "expected"),
+    [
+        (["breaking"], "never", False),
+        (["review"], "breaking", False),
+        (["breaking"], "breaking", True),
+        (["safe", "review"], "review", True),
+        (["unknown"], "review", False),
+        ([None], "safe", False),
+        ([], "safe", False),
+    ],
+)
+def test_failed(verdicts, fail_on, expected):
+    got = review(updates=[{"verdict": v} for v in verdicts])
+    assert failed(_review(got.body["data"]), fail_on) is expected  # type: ignore[index]
+
+
+def test_marker_matches_the_api():
+    assert gitlab.MARKER == "<!-- depdelta:review -->"

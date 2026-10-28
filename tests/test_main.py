@@ -1,9 +1,11 @@
 # tests/test_main.py
 
+import json
+
 import pytest
 from helpers import CLI_ENGINE, FakeWeb, ok, review, update
 
-from depdelta_cli import gitlab, main, web
+from depdelta_cli import forgejo, gitlab, main, web
 from depdelta_cli.api import DEFAULT_API_URL, _review
 from depdelta_cli.main import failed, run
 
@@ -46,6 +48,41 @@ def gitlab_env(base: str, head: str) -> dict:
         "CI_PROJECT_ID": "42",
         "CI_PROJECT_URL": "https://gl.test/acme/web",
         "GITLAB_TOKEN": "tok",
+    }
+
+
+def actions_env(tmp_path, base: str, head: str) -> dict:
+    event = tmp_path / "event.json"
+    event.write_text(
+        json.dumps(
+            {
+                "number": 7,
+                "pull_request": {"merge_base": base, "head": {"sha": head}},
+            }
+        )
+    )
+    return {
+        **KEY,
+        "FORGEJO_ACTIONS": "true",
+        "GITHUB_EVENT_PATH": str(event),
+        "GITHUB_SERVER_URL": "https://cb.test",
+        "GITHUB_API_URL": "https://cb.test/api/v1",
+        "GITHUB_REPOSITORY": "acme/web",
+        "FORGEJO_TOKEN": "tok",
+    }
+
+
+def woodpecker_env(head: str) -> dict:
+    return {
+        **KEY,
+        "CI": "woodpecker",
+        "CI_FORGE_TYPE": "gitea",
+        "CI_FORGE_URL": "https://gt.test",
+        "CI_REPO": "acme/web",
+        "CI_REPO_URL": "https://gt.test/acme/web",
+        "CI_COMMIT_SHA": head,
+        "CI_COMMIT_PULL_REQUEST": "7",
+        "GITEA_TOKEN": "gtok",
     }
 
 
@@ -256,6 +293,104 @@ def test_failed(verdicts, fail_on, expected):
 
 def test_marker_matches_the_api():
     assert gitlab.MARKER == "<!-- depdelta:review -->"
+    assert forgejo.MARKER == gitlab.MARKER
+
+
+def test_run_forgejo_actions_success(repo, change, tmp_path, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(review(updates=[update()]), ok([]), ok({"id": 1}, 201))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], actions_env(tmp_path, base, head)) == 0
+
+    asked, listing, added = fake.calls
+    assert asked["body"]["format"] == "markdown"
+    assert [f["path"] for f in asked["body"]["files"]] == ["package.json"]
+    assert asked["body"]["source_url"] == f"https://cb.test/acme/web/src/commit/{head}"
+    assert listing["url"] == "https://cb.test/api/v1/repos/acme/web/issues/7/comments"
+    assert added["headers"] == {"Authorization": "token tok"}
+    assert added["body"] == {"body": "### DepDelta review"}
+    assert "Review comment added on the pull request." in capsys.readouterr().err
+
+
+def test_run_woodpecker_asks_for_the_merge_base(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(
+        ok({"merge_base": base}),
+        review(updates=[update()]),
+        ok([{"id": 4, "body": forgejo.MARKER}]),
+        ok({"id": 4}),
+    )
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], woodpecker_env(head)) == 0
+
+    pull, asked, _, edited = fake.calls
+    assert pull["url"] == "https://gt.test/api/v1/repos/acme/web/pulls/7"
+    assert pull["headers"] == {"Authorization": "token gtok"}
+    assert [f["path"] for f in asked["body"]["files"]] == ["package.json"]
+    assert edited["url"] == "https://gt.test/api/v1/repos/acme/web/issues/comments/4"
+    assert "Review comment updated on the pull request." in capsys.readouterr().err
+
+
+def test_run_forgejo_actions_token_fallback(repo, change, tmp_path, monkeypatch):
+    base, head = change
+    fake = FakeWeb(review(), ok([]), ok({"id": 1}, 201))
+    monkeypatch.setattr(web, "request", fake)
+    env = actions_env(tmp_path, base, head)
+    del env["FORGEJO_TOKEN"]
+    env["GITHUB_TOKEN"] = "ghtok"
+
+    assert run(["--repo", str(repo)], env) == 0
+    assert fake.calls[2]["headers"] == {"Authorization": "token ghtok"}
+
+
+def test_run_forgejo_without_token(repo, change, tmp_path, monkeypatch, capsys):
+    base, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(review()))
+    env = {**actions_env(tmp_path, base, head), "FORGEJO_TOKEN": " "}
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "Set FORGEJO_TOKEN (or GITEA_TOKEN)" in capsys.readouterr().err
+
+
+def test_run_woodpecker_without_token(repo, change, monkeypatch, capsys):
+    _, head = change
+    fake = FakeWeb()
+    monkeypatch.setattr(web, "request", fake)
+    env = woodpecker_env(head)
+    del env["GITEA_TOKEN"]
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert fake.calls == []
+    assert "Set FORGEJO_TOKEN (or GITEA_TOKEN)" in capsys.readouterr().err
+
+
+def test_run_woodpecker_merge_base_refused(repo, change, monkeypatch, capsys):
+    _, head = change
+    monkeypatch.setattr(web, "request", FakeWeb(ok({"message": "not found"}, 404)))
+
+    assert run(["--repo", str(repo)], woodpecker_env(head)) == 2
+    err = capsys.readouterr().err
+    assert "Forgejo/Gitea answered 404 showing the pull request" in err
+
+
+def test_run_forgejo_post_fails(repo, change, tmp_path, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(review(), ok({"message": "token is required"}, 401))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], actions_env(tmp_path, base, head)) == 2
+    assert "Forgejo/Gitea answered 401 listing comments" in capsys.readouterr().err
+
+
+def test_run_forgejo_not_a_pull_request(repo, tmp_path, capsys):
+    event = tmp_path / "push.json"
+    event.write_text(json.dumps({"ref": "refs/heads/main"}))
+    env = {**KEY, "GITEA_ACTIONS": "true", "GITHUB_EVENT_PATH": str(event)}
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "Not a pull request workflow" in capsys.readouterr().err
 
 
 def _blocked(blocked: bool = True, notes: list | None = None):

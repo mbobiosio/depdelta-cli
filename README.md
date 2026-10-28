@@ -4,7 +4,8 @@
 [![CI](https://github.com/mbobiosio/depdelta-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/mbobiosio/depdelta-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Know what a dependency update breaks before you merge, on Gerrit and GitLab.
+Know what a dependency update breaks before you merge, on Gerrit, GitLab,
+Forgejo and Gitea (Codeberg included).
 
 [DepDelta](https://depdelta.com) reads every release's notes, security
 advisories and published API between two versions of a package, and says
@@ -30,8 +31,8 @@ On every change that touches a manifest or lockfile, `depdelta`:
 3. looks for those declarations in the checkout, and sends only the hits
    (path, line, symbol);
 4. posts the review: a Gerrit change message (no vote), or one GitLab merge
-   request note that later pipelines edit in place. Each update links to its
-   full comparison on depdelta.com.
+   request note or Forgejo/Gitea pull request comment that later runs edit
+   in place. Each update links to its full comparison on depdelta.com.
 
 Beyond each update, the review says what the change does to your lockfiles:
 packages before and after, new and removed direct dependencies (dev or
@@ -129,6 +130,76 @@ depdelta:
 
 Uses link to the files at the merge request's head commit.
 
+## Forgejo and Gitea
+
+Codeberg, self-hosted Forgejo and Gitea share one API, so one setup covers
+them: Forgejo Actions, Gitea Actions, or Woodpecker CI. The review is one
+pull request comment that later runs edit in place. The token comes from
+`FORGEJO_TOKEN`, else `GITEA_TOKEN`, else `GITHUB_TOKEN`.
+
+### Forgejo Actions and Gitea Actions
+
+The workflow's own token can comment on pull requests from branches of the
+same repository. On a pull request from a fork it is read-only (and secrets
+are not passed), so the review can't be posted there.
+
+```yaml
+# .forgejo/workflows/depdelta.yml (Gitea: .gitea/workflows/depdelta.yml)
+on: pull_request
+
+jobs:
+  depdelta:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: DepDelta
+        # A DepDelta outage shouldn't fail the pull request.
+        continue-on-error: true
+        env:
+          DEPDELTA_API_KEY: ${{ secrets.DEPDELTA_API_KEY }}
+          FORGEJO_TOKEN: ${{ github.token }}
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          ~/.local/bin/uvx --from depdelta-cli depdelta
+```
+
+The job needs Python 3.11+ and git; the lines above fetch Python with
+[uv](https://docs.astral.sh/uv/). With Python on the runner,
+`pip install depdelta-cli && depdelta` does the same. A pull request that
+touches no manifests or lockfiles ends at once with nothing to review.
+
+### Woodpecker CI
+
+For a Forgejo or Gitea forge (`CI_FORGE_TYPE` is `forgejo` or `gitea`).
+Woodpecker has no token for the forge: make an access token with the
+`write:issue` and `read:repository` scopes (a bot account works best) and
+store it as a secret. Woodpecker hides secrets from pull requests until
+you allow the `pull_request` event on each one.
+
+```yaml
+# .woodpecker/depdelta.yaml
+when:
+  - event: pull_request
+
+steps:
+  - name: depdelta
+    image: ghcr.io/mbobiosio/depdelta-cli:latest
+    commands:
+      - depdelta
+    environment:
+      DEPDELTA_API_KEY:
+        from_secret: depdelta_api_key
+      FORGEJO_TOKEN:
+        from_secret: forgejo_token
+    failure: ignore
+```
+
+Woodpecker names only the target branch, so `depdelta` asks the forge for
+the pull request's merge base, and fetches it when the clone is shallow.
+Uses link to the files at the pull request's head commit.
+
 ## Options
 
 ```
@@ -174,8 +245,8 @@ falls back to the defaults, and the review says why.
 
 Only the changed manifests and lockfiles leave CI, plus, for updates with
 removed or changed APIs, the path, line and symbol of each use found. The
-source code stays in CI. Gerrit and GitLab credentials are sent only to your
-Gerrit or GitLab. The [privacy policy](https://depdelta.com/privacy) has the
+source code stays in CI. Gerrit, GitLab, Forgejo and Gitea credentials are
+sent only to your Gerrit, GitLab, Forgejo or Gitea. The [privacy policy](https://depdelta.com/privacy) has the
 details.
 
 ## Links

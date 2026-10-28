@@ -1,7 +1,8 @@
 # src/depdelta_cli/main.py
 #
 # `depdelta`: review the change's dependency updates and post the review on
-# the change (a Gerrit message, or a GitLab merge request note).
+# the change (a Gerrit message, a GitLab merge request note, or a Forgejo or
+# Gitea pull request comment).
 #
 #   1. The manifests and lockfiles the change touched go to DepDelta.
 #   2. DepDelta answers with each update's verdict and, for npm and Maven,
@@ -20,10 +21,17 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
-from depdelta_cli import __version__, check, gerrit, gitlab, web
+from depdelta_cli import __version__, check, forgejo, gerrit, gitlab, web
 from depdelta_cli.api import DEFAULT_API_URL, ApiError, DepDelta, Review
-from depdelta_cli.env import Change, EnvError, GerritChange, GitLabMergeRequest
+from depdelta_cli.env import (
+    Change,
+    EnvError,
+    ForgejoPullRequest,
+    GerritChange,
+    GitLabMergeRequest,
+)
 from depdelta_cli.env import detect as detect_change
 from depdelta_cli.git import (
     GitError,
@@ -37,6 +45,9 @@ from depdelta_cli.git import (
 MAX_FILES = 40
 #: Verdicts from riskiest; --fail-on X fails on X and anything riskier.
 VERDICTS = ("breaking", "review", "unknown", "safe")
+#: Tried in turn for Forgejo and Gitea: Forgejo Actions sets the first,
+#: Gitea Actions' token is GITEA_TOKEN, both alias it as GITHUB_TOKEN.
+FORGEJO_TOKENS = ("FORGEJO_TOKEN", "GITEA_TOKEN", "GITHUB_TOKEN")
 
 
 class UsageError(Exception):
@@ -47,7 +58,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="depdelta",
         description="Review a change's dependency updates with DepDelta and "
-        "post the review on the Gerrit change or GitLab merge request.",
+        "post the review on the Gerrit change, GitLab merge request, or Forgejo "
+        "or Gitea pull request.",
     )
     p.add_argument("--version", action="version", version=f"depdelta {__version__}")
     p.add_argument("--repo", default=".", help="The checkout (default: .)")
@@ -91,13 +103,28 @@ def _need(env: Mapping[str, str], name: str, why: str) -> str:
     return value
 
 
+def _forgejo_token(env: Mapping[str, str]) -> str:
+    for name in FORGEJO_TOKENS:
+        value = env.get(name, "").strip()
+        if value:
+            return value
+    raise UsageError(
+        "Set FORGEJO_TOKEN (or GITEA_TOKEN) to a token that can comment on "
+        "the pull request."
+    )
+
+
 def _change(args: argparse.Namespace, env: Mapping[str, str]) -> Change | None:
     """The CI's change, or None for --base/--head given by hand."""
     if args.base or args.head:
         if not (args.base and args.head):
             raise UsageError("Pass both --base and --head.")
         return None
-    return detect_change(env)
+    change = detect_change(env)
+    if isinstance(change.target, ForgejoPullRequest) and not change.base:
+        base = forgejo.merge_base(change.target, _forgejo_token(env))
+        change = replace(change, base=base)
+    return change
 
 
 def _review(
@@ -131,6 +158,9 @@ def _post(change: Change, review: Review, env: Mapping[str, str]) -> None:
         token = _need(env, "GITLAB_TOKEN", "to a token with the api scope")
         done = gitlab.post(target, review.body, token)
         log(f"Review note {done} on the merge request.")
+    elif isinstance(target, ForgejoPullRequest):
+        done = forgejo.post(target, review.body, _forgejo_token(env))
+        log(f"Review comment {done} on the pull request.")
 
 
 def failed(review: Review, fail_on: str) -> bool:
@@ -186,6 +216,7 @@ def run(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None)
         ApiError,
         gerrit.GerritError,
         gitlab.GitLabError,
+        forgejo.ForgejoError,
         web.HttpError,
     ) as error:
         log(str(error))

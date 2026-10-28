@@ -1,10 +1,13 @@
 # tests/test_env.py
 
+import json
+
 import pytest
 
 from depdelta_cli.env import (
     Change,
     EnvError,
+    ForgejoPullRequest,
     GerritChange,
     GitLabMergeRequest,
     _gerrit_root,
@@ -26,6 +29,47 @@ GITLAB = {
     "CI_PROJECT_ID": "42",
     "CI_PROJECT_URL": "https://gitlab.example.com/acme/web/",
 }
+ACTIONS = {
+    "FORGEJO_ACTIONS": "true",
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_SHA": "sha",
+    "GITHUB_SERVER_URL": "https://codeberg.org/",
+    "GITHUB_API_URL": "https://codeberg.org/api/v1/",
+    "GITHUB_REPOSITORY": "acme/web",
+}
+PULL_EVENT = {
+    "action": "opened",
+    "number": 7,
+    "pull_request": {
+        "number": 7,
+        "merge_base": "abc",
+        "base": {"sha": "tip"},
+        "head": {"sha": "def"},
+    },
+}
+WOODPECKER = {
+    "CI": "woodpecker",
+    "CI_FORGE_TYPE": "forgejo",
+    "CI_FORGE_URL": "https://codeberg.org/",
+    "CI_REPO": "acme/web",
+    "CI_REPO_URL": "https://codeberg.org/acme/web/",
+    "CI_COMMIT_SHA": "def",
+    "CI_COMMIT_PULL_REQUEST": "7",
+    "CI_PIPELINE_EVENT": "pull_request",
+}
+
+
+@pytest.fixture
+def actions(tmp_path):
+    """The Actions variables, with ``event`` saved where GITHUB_EVENT_PATH
+    points."""
+
+    def env(event: object = PULL_EVENT, **extra: str) -> dict:
+        path = tmp_path / "event.json"
+        path.write_text(json.dumps(event))
+        return {**ACTIONS, "GITHUB_EVENT_PATH": str(path), **extra}
+
+    return env
 
 
 def test_detect_gerrit_success():
@@ -100,3 +144,128 @@ def test_detect_gitlab_not_a_merge_request():
 def test_detect_no_change():
     with pytest.raises(EnvError, match="No change found"):
         detect({})
+
+
+def test_detect_forgejo_actions_success(actions):
+    assert detect(actions()) == Change(
+        platform="forgejo",
+        base="abc",
+        head="def",
+        source_url="https://codeberg.org/acme/web/src/commit/def",
+        target=ForgejoPullRequest(
+            api_url="https://codeberg.org/api/v1", repo="acme/web", index="7"
+        ),
+    )
+
+
+def test_detect_gitea_actions_success(actions):
+    env = actions(GITEA_ACTIONS="true")
+    del env["FORGEJO_ACTIONS"]
+
+    change = detect(env)
+
+    assert change.platform == "forgejo"
+    assert change.target == ForgejoPullRequest(
+        "https://codeberg.org/api/v1", "acme/web", "7"
+    )
+
+
+def test_detect_forgejo_actions_base_without_merge_base(actions):
+    pull = {"number": 7, "base": {"sha": "tip"}, "head": {"sha": "def"}}
+
+    assert detect(actions({"pull_request": pull})).base == "tip"
+
+
+def test_detect_forgejo_actions_without_commits(actions):
+    # No base: the forge is asked later; no head: GITHUB_SHA.
+    change = detect(actions({"number": 7, "pull_request": {"base": None}}))
+
+    assert (change.base, change.head) == ("", "sha")
+
+
+def test_detect_forgejo_actions_without_server_url(actions):
+    assert detect(actions(GITHUB_SERVER_URL="")).source_url is None
+
+
+@pytest.mark.parametrize(
+    "event", [{"ref": "refs/heads/main"}, ["not", "an", "object"], None]
+)
+def test_detect_forgejo_actions_not_a_pull_request(actions, event):
+    with pytest.raises(EnvError, match="Not a pull request workflow"):
+        detect(actions(event))
+
+
+def test_detect_forgejo_actions_without_a_number(actions):
+    with pytest.raises(EnvError, match="no pull request number"):
+        detect(actions({"pull_request": {"head": {"sha": "def"}}}))
+
+
+def test_detect_forgejo_actions_unreadable_payload(actions, tmp_path):
+    env = actions(GITHUB_EVENT_PATH=str(tmp_path / "missing.json"))
+
+    with pytest.raises(EnvError, match="Can't read the event payload"):
+        detect(env)
+
+
+def test_detect_forgejo_actions_payload_not_json(actions, tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("{")
+
+    with pytest.raises(EnvError, match="Can't read the event payload"):
+        detect(actions(GITHUB_EVENT_PATH=str(path)))
+
+
+@pytest.mark.parametrize(
+    "name", ["GITHUB_EVENT_PATH", "GITHUB_REPOSITORY", "GITHUB_API_URL"]
+)
+def test_detect_forgejo_actions_missing_variable(actions, name):
+    env = actions()
+    del env[name]
+
+    with pytest.raises(EnvError, match=f"{name} is not set"):
+        detect(env)
+
+
+@pytest.mark.parametrize("forge", ["forgejo", "gitea"])
+def test_detect_woodpecker_success(forge):
+    assert detect({**WOODPECKER, "CI_FORGE_TYPE": forge}) == Change(
+        platform="forgejo",
+        base="",
+        head="def",
+        source_url="https://codeberg.org/acme/web/src/commit/def",
+        target=ForgejoPullRequest(
+            api_url="https://codeberg.org/api/v1", repo="acme/web", index="7"
+        ),
+    )
+
+
+def test_detect_woodpecker_without_repo_url():
+    assert detect({**WOODPECKER, "CI_REPO_URL": ""}).source_url is None
+
+
+def test_detect_woodpecker_not_a_pull_request():
+    env = {**WOODPECKER, "CI_COMMIT_PULL_REQUEST": "", "CI_PIPELINE_EVENT": "push"}
+
+    with pytest.raises(EnvError, match="Not a pull request pipeline"):
+        detect(env)
+
+
+@pytest.mark.parametrize("name", ["CI_COMMIT_SHA", "CI_FORGE_URL", "CI_REPO"])
+def test_detect_woodpecker_missing_variable(name):
+    env = {**WOODPECKER, name: ""}
+
+    with pytest.raises(EnvError, match=f"{name} is not set"):
+        detect(env)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {**WOODPECKER, "CI_FORGE_TYPE": "github"},
+        {**WOODPECKER, "CI": "true"},
+        {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_PATH": "/x"},
+    ],
+)
+def test_detect_unsupported_ci(env):
+    with pytest.raises(EnvError, match="No change found"):
+        detect(env)

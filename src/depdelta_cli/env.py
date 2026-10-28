@@ -2,12 +2,14 @@
 #
 # Which change this CI job is for, read from the variables the CI sets:
 # Jenkins with the Gerrit Trigger plugin, a GitLab merge request pipeline,
-# or a Forgejo or Gitea pull request (their Actions, or Woodpecker).
+# a Forgejo or Gitea pull request (their Actions, or Woodpecker), a
+# Bitbucket Cloud pull request pipeline, or an Azure Pipelines build of an
+# Azure Repos pull request.
 
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeAlias
 from urllib.parse import quote, urlsplit
 
 
@@ -42,14 +44,43 @@ class ForgejoPullRequest:
 
 
 @dataclass(frozen=True)
+class BitbucketPullRequest:
+    #: https://api.bitbucket.org/2.0
+    api_url: str
+    #: `workspace/repo-slug`
+    repo: str
+    id: str
+    #: The destination branch's commit when the pipeline ran.
+    destination: str
+
+
+@dataclass(frozen=True)
+class AzurePullRequest:
+    #: https://dev.azure.com/org/project/_apis/git/repositories/<id>
+    repo_url: str
+    id: str
+
+
+Target: TypeAlias = (
+    GerritChange
+    | GitLabMergeRequest
+    | ForgejoPullRequest
+    | BitbucketPullRequest
+    | AzurePullRequest
+)
+
+
+@dataclass(frozen=True)
 class Change:
-    platform: Literal["gerrit", "gitlab", "forgejo"]
-    #: Empty when the CI doesn't say: the forge is asked (Woodpecker).
+    platform: Literal["gerrit", "gitlab", "forgejo", "bitbucket", "azure"]
+    #: Empty when the CI doesn't say: the forge is asked (Woodpecker,
+    #: Bitbucket, Azure DevOps).
     base: str
     head: str
-    #: Files' page at the head commit; uses link into it.
+    #: Files' page at the head commit (uses link to `<it>/<path>#L<line>`),
+    #: or a link with `{path}` and `{line}` where that style doesn't work.
     source_url: str | None
-    target: GerritChange | GitLabMergeRequest | ForgejoPullRequest
+    target: Target
 
 
 #: Woodpecker's CI_FORGE_TYPE values that speak the Forgejo/Gitea API.
@@ -189,6 +220,70 @@ def woodpecker(env: Mapping[str, str]) -> Change:
     )
 
 
+def bitbucket(env: Mapping[str, str]) -> Change:
+    """A Bitbucket Cloud pipeline for a pull request (`pipelines:
+    pull-requests:`)."""
+    pr_id = env.get("BITBUCKET_PR_ID", "").strip()
+    if not pr_id:
+        raise EnvError(
+            "Not a pull request pipeline: run the step under pipelines: pull-requests:."
+        )
+    head = _need(env, "BITBUCKET_COMMIT")
+    repo = _need(env, "BITBUCKET_REPO_FULL_NAME")
+    return Change(
+        platform="bitbucket",
+        # Bitbucket names the destination's tip, not where the pull request
+        # starts: Bitbucket is asked for the merge base.
+        base="",
+        head=head,
+        source_url=f"https://bitbucket.org/{repo}/src/{head}/{{path}}#lines-{{line}}",
+        target=BitbucketPullRequest(
+            api_url="https://api.bitbucket.org/2.0",
+            repo=repo,
+            id=pr_id,
+            destination=_need(env, "BITBUCKET_PR_DESTINATION_COMMIT"),
+        ),
+    )
+
+
+def azure(env: Mapping[str, str]) -> Change:
+    """An Azure Pipelines build of an Azure Repos pull request (a branch
+    policy's build validation)."""
+    if env.get("BUILD_REASON") != "PullRequest":
+        raise EnvError(
+            "Not a pull request build: add the pipeline as build validation "
+            "in the target branch's policies."
+        )
+    if env.get("BUILD_REPOSITORY_PROVIDER") != "TfsGit":
+        raise EnvError(
+            "The repository isn't in Azure Repos; for GitHub, install the "
+            "DepDelta GitHub App instead."
+        )
+    head = _need(env, "SYSTEM_PULLREQUEST_SOURCECOMMITID")
+    collection = _need(env, "SYSTEM_COLLECTIONURI").rstrip("/")
+    project = quote(_need(env, "SYSTEM_TEAMPROJECT"), safe="")
+    name = quote(_need(env, "BUILD_REPOSITORY_NAME"), safe="")
+    return Change(
+        platform="azure",
+        # The build checks out a merge commit: Azure DevOps is asked for
+        # where the pull request starts.
+        base="",
+        head=head,
+        source_url=(
+            f"{collection}/{project}/_git/{name}?path=/{{path}}&version=GC{head}"
+            "&line={line}&lineEnd={line}&lineStartColumn=1&lineEndColumn=1"
+            "&lineStyle=plain&_a=contents"
+        ),
+        target=AzurePullRequest(
+            repo_url=(
+                f"{collection}/{project}/_apis/git/repositories/"
+                f"{quote(_need(env, 'BUILD_REPOSITORY_ID'), safe='')}"
+            ),
+            id=_need(env, "SYSTEM_PULLREQUEST_PULLREQUESTID"),
+        ),
+    )
+
+
 def detect(env: Mapping[str, str]) -> Change:
     """The change from the CI's variables."""
     if env.get("GERRIT_CHANGE_NUMBER"):
@@ -200,8 +295,13 @@ def detect(env: Mapping[str, str]) -> Change:
         return forgejo_actions(env)
     if env.get("CI") == "woodpecker" and env.get("CI_FORGE_TYPE") in FORGES:
         return woodpecker(env)
+    if env.get("BITBUCKET_BUILD_NUMBER"):
+        return bitbucket(env)
+    if env.get("TF_BUILD"):
+        return azure(env)
     raise EnvError(
         "No change found: run in Jenkins with the Gerrit Trigger plugin, in "
-        "a GitLab merge request pipeline, or on a Forgejo or Gitea pull "
-        "request (Actions or Woodpecker), or pass --base and --head."
+        "a GitLab merge request pipeline, on a Forgejo or Gitea pull request "
+        "(Actions or Woodpecker), in a Bitbucket pull request pipeline or an "
+        "Azure Pipelines pull request build, or pass --base and --head."
     )

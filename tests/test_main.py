@@ -437,3 +437,172 @@ def test_run_not_blocked_passes(repo, commit, monkeypatch):
 
     assert run(["--repo", str(repo), "--base", base, "--head", head], KEY) == 0
     assert "config" not in fake.calls[0]["body"]
+
+
+def bitbucket_env(head: str) -> dict:
+    return {
+        **KEY,
+        "CI": "true",
+        "BITBUCKET_BUILD_NUMBER": "3",
+        "BITBUCKET_PR_ID": "7",
+        "BITBUCKET_COMMIT": head,
+        "BITBUCKET_REPO_FULL_NAME": "acme/web",
+        "BITBUCKET_PR_DESTINATION_COMMIT": "d3st",
+        "BITBUCKET_ACCESS_TOKEN": "bbtok",
+    }
+
+
+def azure_env(head: str) -> dict:
+    return {
+        **KEY,
+        "TF_BUILD": "True",
+        "BUILD_REASON": "PullRequest",
+        "BUILD_REPOSITORY_PROVIDER": "TfsGit",
+        "SYSTEM_PULLREQUEST_SOURCECOMMITID": head,
+        "SYSTEM_COLLECTIONURI": "https://dev.test/acme/",
+        "SYSTEM_TEAMPROJECT": "proj",
+        "BUILD_REPOSITORY_NAME": "web",
+        "BUILD_REPOSITORY_ID": "r1",
+        "SYSTEM_PULLREQUEST_PULLREQUESTID": "7",
+        "SYSTEM_ACCESSTOKEN": "aztok",
+    }
+
+
+def test_run_bitbucket_success(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(
+        ok({"hash": base}),
+        review(updates=[update()]),
+        ok({"values": []}),
+        ok({"id": 1}, 201),
+    )
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], bitbucket_env(head)) == 0
+
+    merge, asked, _, added = fake.calls
+    assert merge["url"] == (
+        f"https://api.bitbucket.org/2.0/repositories/acme/web/merge-base/d3st..{head}"
+    )
+    assert merge["headers"] == {"Authorization": "Bearer bbtok"}
+    assert asked["body"]["format"] == "commonmark"
+    assert asked["body"]["source_link"] == (
+        f"https://bitbucket.org/acme/web/src/{head}/{{path}}#lines-{{line}}"
+    )
+    assert "source_url" not in asked["body"]
+    assert added["body"] == {"content": {"raw": "### DepDelta review"}}
+    assert "Review comment added on the pull request." in capsys.readouterr().err
+
+
+def test_run_bitbucket_api_token(repo, change, monkeypatch):
+    base, head = change
+    fake = FakeWeb(ok({"hash": base}), review(), ok({"values": []}), ok({}, 201))
+    monkeypatch.setattr(web, "request", fake)
+    env = bitbucket_env(head)
+    del env["BITBUCKET_ACCESS_TOKEN"]
+    env |= {"BITBUCKET_EMAIL": "ci@acme.test", "BITBUCKET_API_TOKEN": "at"}
+
+    assert run(["--repo", str(repo)], env) == 0
+    assert fake.calls[0]["headers"] == {
+        "Authorization": web.basic("ci@acme.test", "at")
+    }
+
+
+def test_run_bitbucket_without_credentials(repo, change, capsys):
+    env = bitbucket_env(change[1])
+    del env["BITBUCKET_ACCESS_TOKEN"]
+    env["BITBUCKET_EMAIL"] = "ci@acme.test"
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "Set BITBUCKET_ACCESS_TOKEN" in capsys.readouterr().err
+
+
+def test_run_bitbucket_post_fails(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(ok({"hash": base}), review(), ok({"values": []}), ok("no", 403))
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], bitbucket_env(head)) == 2
+    assert "Bitbucket answered 403 adding the comment" in capsys.readouterr().err
+
+
+def test_run_azure_success(repo, change, monkeypatch, capsys):
+    base, head = change
+    fake = FakeWeb(
+        ok({"lastMergeTargetCommit": {"commitId": "tgt"}}),
+        ok({"value": [{"commitId": base}]}),
+        review(updates=[update()]),
+        ok(
+            {
+                "value": [
+                    {
+                        "id": 4,
+                        "comments": [{"id": 1, "content": "[//]: # (depdelta:review)"}],
+                    }
+                ]
+            }
+        ),
+        ok({"id": 1}),
+    )
+    monkeypatch.setattr(web, "request", fake)
+
+    assert run(["--repo", str(repo)], azure_env(head)) == 0
+
+    pull, _, asked, _, edited = fake.calls
+    assert pull["headers"] == {"Authorization": "Bearer aztok"}
+    assert asked["body"]["format"] == "commonmark"
+    assert asked["body"]["source_link"].startswith(
+        "https://dev.test/acme/proj/_git/web?path=/{path}&version=GC"
+    )
+    assert edited["url"] == (
+        "https://dev.test/acme/proj/_apis/git/repositories/r1/pullRequests/7"
+        "/threads/4/comments/1?api-version=7.1"
+    )
+    assert "Review thread updated on the pull request." in capsys.readouterr().err
+
+
+def test_run_azure_personal_access_token(repo, change, monkeypatch):
+    base, head = change
+    fake = FakeWeb(
+        ok({"lastMergeTargetCommit": {"commitId": "tgt"}}),
+        ok({"value": [{"commitId": base}]}),
+        review(),
+        ok({"value": []}),
+        ok({"id": 9}),
+    )
+    monkeypatch.setattr(web, "request", fake)
+    env = azure_env(head)
+    del env["SYSTEM_ACCESSTOKEN"]
+    env["AZURE_DEVOPS_TOKEN"] = "pat"
+
+    assert run(["--repo", str(repo)], env) == 0
+    assert fake.calls[0]["headers"] == {"Authorization": web.basic("", "pat")}
+
+
+def test_run_azure_without_token(repo, change, capsys):
+    env = azure_env(change[1])
+    del env["SYSTEM_ACCESSTOKEN"]
+
+    assert run(["--repo", str(repo)], env) == 2
+    assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in capsys.readouterr().err
+
+
+def test_run_azure_merge_base_refused(repo, change, monkeypatch, capsys):
+    monkeypatch.setattr(web, "request", FakeWeb(ok({"message": "nope"}, 401)))
+
+    assert run(["--repo", str(repo)], azure_env(change[1])) == 2
+    assert (
+        "Azure DevOps answered 401 showing the pull request" in capsys.readouterr().err
+    )
+
+
+def test_run_format_option_wins(repo, change, monkeypatch):
+    base, head = change
+    fake = FakeWeb(review(), ok({"values": []}), ok({}, 201))
+    monkeypatch.setattr(web, "request", fake)
+    env = bitbucket_env(head)
+
+    with monkeypatch.context() as m:
+        m.setattr(main, "_merge_base", lambda change, env: base)
+        assert run(["--repo", str(repo), "--format", "markdown"], env) == 0
+    assert fake.calls[0]["body"]["format"] == "markdown"

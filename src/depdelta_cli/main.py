@@ -1,8 +1,9 @@
 # src/depdelta_cli/main.py
 #
 # `depdelta`: review the change's dependency updates and post the review on
-# the change (a Gerrit message, a GitLab merge request note, or a Forgejo or
-# Gitea pull request comment).
+# the change (a Gerrit message, a GitLab merge request note, a Forgejo or
+# Gitea pull request comment, a Bitbucket Cloud pull request comment, or an
+# Azure DevOps pull request thread).
 #
 #   1. The manifests and lockfiles the change touched go to DepDelta.
 #   2. DepDelta answers with each update's verdict and, for npm and Maven,
@@ -23,9 +24,20 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
-from depdelta_cli import __version__, check, forgejo, gerrit, gitlab, web
+from depdelta_cli import (
+    __version__,
+    azure,
+    bitbucket,
+    check,
+    forgejo,
+    gerrit,
+    gitlab,
+    web,
+)
 from depdelta_cli.api import DEFAULT_API_URL, ApiError, DepDelta, Review
 from depdelta_cli.env import (
+    AzurePullRequest,
+    BitbucketPullRequest,
     Change,
     EnvError,
     ForgejoPullRequest,
@@ -48,6 +60,9 @@ VERDICTS = ("breaking", "review", "unknown", "safe")
 #: Tried in turn for Forgejo and Gitea: Forgejo Actions sets the first,
 #: Gitea Actions' token is GITEA_TOKEN, both alias it as GITHUB_TOKEN.
 FORGEJO_TOKENS = ("FORGEJO_TOKEN", "GITEA_TOKEN", "GITHUB_TOKEN")
+#: Review format per platform: Gerrit is plain text; Bitbucket and Azure
+#: DevOps show HTML as text.
+FORMATS = {"gerrit": "text", "bitbucket": "commonmark", "azure": "commonmark"}
 
 
 class UsageError(Exception):
@@ -58,8 +73,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="depdelta",
         description="Review a change's dependency updates with DepDelta and "
-        "post the review on the Gerrit change, GitLab merge request, or Forgejo "
-        "or Gitea pull request.",
+        "post the review on the Gerrit change, GitLab merge request, or the "
+        "Forgejo, Gitea, Bitbucket or Azure DevOps pull request.",
     )
     p.add_argument("--version", action="version", version=f"depdelta {__version__}")
     p.add_argument("--repo", default=".", help="The checkout (default: .)")
@@ -73,8 +88,9 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--format",
-        choices=("markdown", "text"),
-        help="Review format (default: text for Gerrit, markdown otherwise)",
+        choices=("markdown", "commonmark", "text"),
+        help="Review format (default: text for Gerrit, commonmark for Bitbucket "
+        "and Azure DevOps, markdown otherwise)",
     )
     p.add_argument(
         "--wait",
@@ -114,6 +130,46 @@ def _forgejo_token(env: Mapping[str, str]) -> str:
     )
 
 
+def _bitbucket_auth(env: Mapping[str, str]) -> str:
+    token = env.get("BITBUCKET_ACCESS_TOKEN", "").strip()
+    if token:
+        return f"Bearer {token}"
+    email = env.get("BITBUCKET_EMAIL", "").strip()
+    api_token = env.get("BITBUCKET_API_TOKEN", "").strip()
+    if email and api_token:
+        return web.basic(email, api_token)
+    raise UsageError(
+        "Set BITBUCKET_ACCESS_TOKEN to a repository access token with the "
+        "pullrequest:write scope (or BITBUCKET_EMAIL and BITBUCKET_API_TOKEN)."
+    )
+
+
+def _azure_auth(env: Mapping[str, str]) -> str:
+    token = env.get("SYSTEM_ACCESSTOKEN", "").strip()
+    if token:
+        return f"Bearer {token}"
+    pat = env.get("AZURE_DEVOPS_TOKEN", "").strip()
+    if pat:
+        return web.basic("", pat)
+    raise UsageError(
+        "Map SYSTEM_ACCESSTOKEN: $(System.AccessToken) into the step's env "
+        "(or set AZURE_DEVOPS_TOKEN to a personal access token with Code: "
+        "Read & write)."
+    )
+
+
+def _merge_base(change: Change, env: Mapping[str, str]) -> str:
+    """Where the pull request starts, from the forge, for a CI that doesn't
+    say."""
+    target = change.target
+    if isinstance(target, BitbucketPullRequest):
+        return bitbucket.merge_base(target, change.head, _bitbucket_auth(env))
+    if isinstance(target, AzurePullRequest):
+        return azure.merge_base(target, change.head, _azure_auth(env))
+    assert isinstance(target, ForgejoPullRequest)
+    return forgejo.merge_base(target, _forgejo_token(env))
+
+
 def _change(args: argparse.Namespace, env: Mapping[str, str]) -> Change | None:
     """The CI's change, or None for --base/--head given by hand."""
     if args.base or args.head:
@@ -121,9 +177,8 @@ def _change(args: argparse.Namespace, env: Mapping[str, str]) -> Change | None:
             raise UsageError("Pass both --base and --head.")
         return None
     change = detect_change(env)
-    if isinstance(change.target, ForgejoPullRequest) and not change.base:
-        base = forgejo.merge_base(change.target, _forgejo_token(env))
-        change = replace(change, base=base)
+    if not change.base:
+        change = replace(change, base=_merge_base(change, env))
     return change
 
 
@@ -161,6 +216,12 @@ def _post(change: Change, review: Review, env: Mapping[str, str]) -> None:
     elif isinstance(target, ForgejoPullRequest):
         done = forgejo.post(target, review.body, _forgejo_token(env))
         log(f"Review comment {done} on the pull request.")
+    elif isinstance(target, BitbucketPullRequest):
+        done = bitbucket.post(target, review.body, _bitbucket_auth(env))
+        log(f"Review comment {done} on the pull request.")
+    elif isinstance(target, AzurePullRequest):
+        done = azure.post(target, review.body, _azure_auth(env))
+        log(f"Review thread {done} on the pull request.")
 
 
 def failed(review: Review, fail_on: str) -> bool:
@@ -197,7 +258,7 @@ def run(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None)
         key = _need(env, "DEPDELTA_API_KEY", "to an API key from DepDelta Settings")
         api_url = args.api_url or env.get("DEPDELTA_API_URL") or DEFAULT_API_URL
         fmt = args.format or (
-            "text" if change and change.platform == "gerrit" else "markdown"
+            FORMATS.get(change.platform, "markdown") if change else "markdown"
         )
         source_url = change.source_url if change else None
         config = config_file(args.repo, head)
@@ -217,6 +278,8 @@ def run(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None)
         gerrit.GerritError,
         gitlab.GitLabError,
         forgejo.ForgejoError,
+        bitbucket.BitbucketError,
+        azure.AzureError,
         web.HttpError,
     ) as error:
         log(str(error))

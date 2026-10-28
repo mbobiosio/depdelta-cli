@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Know what a dependency update breaks before you merge, on Gerrit, GitLab,
-Forgejo and Gitea (Codeberg included).
+Forgejo and Gitea (Codeberg included), Bitbucket Cloud and Azure DevOps.
 
 [DepDelta](https://depdelta.com) reads every release's notes, security
 advisories and published API between two versions of a package, and says
@@ -31,8 +31,9 @@ On every change that touches a manifest or lockfile, `depdelta`:
 3. looks for those declarations in the checkout, and sends only the hits
    (path, line, symbol);
 4. posts the review: a Gerrit change message (no vote), or one GitLab merge
-   request note or Forgejo/Gitea pull request comment that later runs edit
-   in place. Each update links to its full comparison on depdelta.com.
+   request note, Forgejo/Gitea or Bitbucket pull request comment, or Azure
+   DevOps pull request thread that later runs edit in place. Each update
+   links to its full comparison on depdelta.com.
 
 Beyond each update, the review says what the change does to your lockfiles:
 packages before and after, new and removed direct dependencies (dev or
@@ -200,11 +201,75 @@ Woodpecker names only the target branch, so `depdelta` asks the forge for
 the pull request's merge base, and fetches it when the clone is shallow.
 Uses link to the files at the pull request's head commit.
 
+## Bitbucket Pipelines
+
+Bitbucket Cloud, in a pull request pipeline. Pipelines has no token that can
+comment: make a repository access token with the `pullrequest:write` scope
+(Repository settings → Access tokens) and store it as a secured repository
+variable `BITBUCKET_ACCESS_TOKEN`, next to `DEPDELTA_API_KEY`. An Atlassian
+API token works too: set `BITBUCKET_EMAIL` and `BITBUCKET_API_TOKEN`.
+
+```yaml
+# bitbucket-pipelines.yml
+pipelines:
+  pull-requests:
+    "**":
+      - step:
+          name: DepDelta
+          image: ghcr.io/mbobiosio/depdelta-cli:latest
+          clone:
+            depth: full
+          script:
+            # A DepDelta outage shouldn't fail the pull request.
+            - depdelta || true
+```
+
+Bitbucket shows HTML as text, so the review comes as plain Markdown, one
+section per update. Bitbucket names only the destination's tip, so
+`depdelta` asks Bitbucket for the pull request's merge base. Uses link to
+the lines at the pull request's head commit. To fail the build with
+`--fail-on`, drop the `|| true`.
+
+## Azure Pipelines
+
+Azure Repos pull requests, run as build validation: add the pipeline to the
+target branch's policies (Branch policies → Build validation). Give the
+build service permission to comment: Project settings → Repositories → your
+repository → Security → "*Project* Build Service" → Contribute to pull
+requests: Allow. The job's token reaches `depdelta` only when mapped into
+the step's environment:
+
+```yaml
+# azure-pipelines.yml
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+  - script: pipx run --spec depdelta-cli depdelta
+    displayName: DepDelta
+    # A DepDelta outage shouldn't fail the pull request.
+    continueOnError: true
+    env:
+      DEPDELTA_API_KEY: $(DEPDELTA_API_KEY)
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+```
+
+A personal access token with Code: Read & write works too, as
+`AZURE_DEVOPS_TOKEN`. The review is one pull request thread that later
+builds edit in place; it starts active, so it can be resolved like any
+comment. The build checks out a merge commit, so `depdelta` asks Azure
+DevOps where the pull request starts. Repositories on GitHub built in Azure
+Pipelines aren't covered: use the GitHub app.
+
 ## Options
 
 ```
 depdelta [--repo .] [--base REV --head REV] [--print]
-         [--format markdown|text] [--wait 300]
+         [--format markdown|commonmark|text] [--wait 300]
          [--fail-on never|breaking|review|unknown|safe]
          [--api-url URL]
 ```
@@ -245,8 +310,8 @@ falls back to the defaults, and the review says why.
 
 Only the changed manifests and lockfiles leave CI, plus, for updates with
 removed or changed APIs, the path, line and symbol of each use found. The
-source code stays in CI. Gerrit, GitLab, Forgejo and Gitea credentials are
-sent only to your Gerrit, GitLab, Forgejo or Gitea. The [privacy policy](https://depdelta.com/privacy) has the
+source code stays in CI. Forge credentials (Gerrit, GitLab, Forgejo, Gitea,
+Bitbucket, Azure DevOps) are sent only to that forge. The [privacy policy](https://depdelta.com/privacy) has the
 details.
 
 ## Links

@@ -5,6 +5,8 @@ import json
 import pytest
 
 from depdelta_cli.env import (
+    AzurePullRequest,
+    BitbucketPullRequest,
     Change,
     EnvError,
     ForgejoPullRequest,
@@ -256,6 +258,96 @@ def test_detect_woodpecker_missing_variable(name):
 
     with pytest.raises(EnvError, match=f"{name} is not set"):
         detect(env)
+
+
+BITBUCKET = {
+    "CI": "true",
+    "BITBUCKET_BUILD_NUMBER": "12",
+    "BITBUCKET_PR_ID": "7",
+    "BITBUCKET_COMMIT": "def",
+    "BITBUCKET_REPO_FULL_NAME": "acme/web",
+    "BITBUCKET_PR_DESTINATION_COMMIT": "d3st",
+}
+AZURE = {
+    "TF_BUILD": "True",
+    "BUILD_REASON": "PullRequest",
+    "BUILD_REPOSITORY_PROVIDER": "TfsGit",
+    "SYSTEM_PULLREQUEST_SOURCECOMMITID": "def",
+    "SYSTEM_COLLECTIONURI": "https://dev.azure.com/acme/",
+    "SYSTEM_TEAMPROJECT": "Web App",
+    "BUILD_REPOSITORY_NAME": "web",
+    "BUILD_REPOSITORY_ID": "r-1",
+    "SYSTEM_PULLREQUEST_PULLREQUESTID": "7",
+}
+
+
+def test_detect_bitbucket_success():
+    assert detect(BITBUCKET) == Change(
+        platform="bitbucket",
+        base="",
+        head="def",
+        source_url="https://bitbucket.org/acme/web/src/def/{path}#lines-{line}",
+        target=BitbucketPullRequest(
+            api_url="https://api.bitbucket.org/2.0",
+            repo="acme/web",
+            id="7",
+            destination="d3st",
+        ),
+    )
+
+
+def test_detect_bitbucket_not_a_pull_request():
+    with pytest.raises(EnvError, match="pipelines: pull-requests:"):
+        detect({**BITBUCKET, "BITBUCKET_PR_ID": ""})
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["BITBUCKET_COMMIT", "BITBUCKET_REPO_FULL_NAME", "BITBUCKET_PR_DESTINATION_COMMIT"],
+)
+def test_detect_bitbucket_missing_variable(name):
+    with pytest.raises(EnvError, match=f"{name} is not set"):
+        detect({**BITBUCKET, name: ""})
+
+
+def test_detect_azure_success():
+    change = detect(AZURE)
+    assert change.platform == "azure" and (change.base, change.head) == ("", "def")
+    assert change.target == AzurePullRequest(
+        repo_url="https://dev.azure.com/acme/Web%20App/_apis/git/repositories/r-1",
+        id="7",
+    )
+    assert change.source_url == (
+        "https://dev.azure.com/acme/Web%20App/_git/web?path=/{path}&version=GCdef"
+        "&line={line}&lineEnd={line}&lineStartColumn=1&lineEndColumn=1"
+        "&lineStyle=plain&_a=contents"
+    )
+
+
+def test_detect_azure_not_a_pull_request():
+    with pytest.raises(EnvError, match="build validation"):
+        detect({**AZURE, "BUILD_REASON": "IndividualCI"})
+
+
+def test_detect_azure_github_repository():
+    with pytest.raises(EnvError, match="DepDelta GitHub App"):
+        detect({**AZURE, "BUILD_REPOSITORY_PROVIDER": "GitHub"})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SYSTEM_PULLREQUEST_SOURCECOMMITID",
+        "SYSTEM_COLLECTIONURI",
+        "SYSTEM_TEAMPROJECT",
+        "BUILD_REPOSITORY_NAME",
+        "BUILD_REPOSITORY_ID",
+        "SYSTEM_PULLREQUEST_PULLREQUESTID",
+    ],
+)
+def test_detect_azure_missing_variable(name):
+    with pytest.raises(EnvError, match=f"{name} is not set"):
+        detect({**AZURE, name: ""})
 
 
 @pytest.mark.parametrize(

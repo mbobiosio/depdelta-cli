@@ -99,7 +99,10 @@ class DepDelta:
             "format": fmt,
         }
         if source_url:
-            payload["source_url"] = source_url
+            # A link with {path} and {line} (Bitbucket, Azure DevOps), or the
+            # files' page that `/<path>#L<line>` is added to.
+            key = "source_link" if "{path}" in source_url else "source_url"
+            payload[key] = source_url
         if config is not None:
             payload["config"] = config
         for attempt in range(1, ATTEMPTS + 1):

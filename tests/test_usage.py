@@ -308,3 +308,74 @@ def test_find_usages_java_calls_the_kt_class():
     assert _hits(report) == [
         ("A.java", 2, "ThreadLocalTransactionManagerKt.transaction")
     ]
+
+
+REQUESTS = [
+    ApiSymbol("method", "Session.get_adapter", "requests.sessions", "removed"),
+    ApiSymbol("class", "HTTPAdapter", "requests.adapters", "changed"),
+    ApiSymbol("export", "Timeout", "requests", "removed"),
+    ApiSymbol("constructor", "Session", "requests.sessions", "changed"),
+    ApiSymbol("function", "dump", "yaml", "removed"),
+]
+
+
+def test_find_usages_python_success():
+    text = (
+        "import requests\n"
+        "import os, requests.adapters as ra\n"
+        "from requests import Session as S, adapters\n"
+        "from requests.exceptions import (\n"
+        "    Timeout,\n"
+        ")\n"
+        "from .local import Thing\n"
+        "s = S()\n"
+        "s.get_adapter('x')\n"
+        "adapters.HTTPAdapter()\n"
+        "ra.HTTPAdapter()\n"
+        "requests.sessions.Session().close()\n"
+        "except Timeout:\n"
+    )
+
+    report = find_usages("pypi", "requests", REQUESTS, [("app/client.py", text)])
+
+    assert _hits(report) == [
+        ("app/client.py", 8, "Session"),
+        ("app/client.py", 9, "Session.get_adapter"),
+        ("app/client.py", 10, "HTTPAdapter"),
+        ("app/client.py", 11, "HTTPAdapter"),
+        ("app/client.py", 12, "Session"),
+        ("app/client.py", 13, "Timeout"),
+    ]
+
+
+def test_find_usages_python_star_import():
+    text = "from yaml import *\ndump({})\n"
+
+    report = find_usages("pypi", "pyyaml", REQUESTS, [("tool.py", text)])
+
+    assert _hits(report) == [("tool.py", 2, "dump")]
+
+
+def test_find_usages_python_import_line_when_never_used():
+    text = "from yaml import dump, 3bad, x as 4y\n"
+
+    report = find_usages("pypi", "pyyaml", REQUESTS, [("tool.py", text)])
+
+    assert _hits(report) == [("tool.py", 1, "dump")]
+
+
+def test_find_usages_python_common_member_needs_its_owner():
+    wanted = [ApiSymbol("method", "Session.get", "requests.sessions", "changed")]
+    text = "from requests import Session\ns = Session()\ns.get(1)\nSession.get(s, 1)\n"
+
+    report = find_usages("pypi", "requests", wanted, [("tool.py", text)])
+
+    assert _hits(report) == [("tool.py", 4, "Session.get")]
+
+
+def test_find_usages_python_other_packages_ignored():
+    text = "import os\nfrom json import dump\ndump({})\n"
+
+    report = find_usages("pypi", "pyyaml", REQUESTS, [("tool.py", text)])
+
+    assert report.total == 0

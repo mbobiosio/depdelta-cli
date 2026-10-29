@@ -86,7 +86,7 @@ def test_source_files_success(repo, commit):
 
 
 def test_source_files_no_extensions(repo):
-    assert source_files(str(repo), {"pypi"}) == SourceFiles([], False)
+    assert source_files(str(repo), {"cargo"}) == SourceFiles([], False)
 
 
 def test_source_files_skips_big_and_missing_files(repo, commit, monkeypatch):

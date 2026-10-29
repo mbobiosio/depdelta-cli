@@ -16,6 +16,10 @@
 #             as a Kotlin property included). Kotlin top-level functions and
 #             properties (static members of a `FileKt` class) are matched by
 #             their own name where Kotlin files import them.
+#   Python    files that import the package's top-level module (`import x`,
+#             `from x.sub import Y`); what they import used as the removed or
+#             changed declaration, or reached through an imported module
+#             (`x.sub.Y`), or one of its members.
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -32,6 +36,7 @@ UsageChange = Literal["removed", "changed"]
 SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "npm": (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
     "maven": (".java", ".kt", ".kts"),
+    "pypi": (".py",),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -79,7 +84,7 @@ class ApiSymbol:
     kind: str
     #: Dotted name as declared: `CLIEngine`, `Linter.verify`.
     name: str
-    #: The module (npm) or Java package (Maven) it is declared in.
+    #: The module (npm, PyPI) or Java package (Maven) it is declared in.
     module: str
     change: UsageChange
 
@@ -365,6 +370,90 @@ def _jvm_hits(
             yield from _hits(path, text, symbol, _jvm_patterns(symbol, local), imports)
 
 
+# ── Python ───────────────────────────────────────────────────────────────────
+
+_PY_FROM = re.compile(
+    r"^[ \t]*from[ \t]+(?P<module>[\w.]+)[ \t]+import[ \t]+"
+    r"(?P<names>\([^)]*\)|[^\n#;]*)",
+    re.MULTILINE,
+)
+_PY_IMPORT = re.compile(r"^[ \t]*import[ \t]+(?P<names>[^\n#;]+)", re.MULTILINE)
+#: Attributes between a module binding and the name (`x.sub.Y`).
+_PY_CHAIN = r"(?:\s*\.\s*[A-Za-z_]\w*)*?\s*\.\s*"
+
+
+@dataclass
+class _PyImports:
+    #: Local name → the name it's imported as.
+    named: dict[str, str]
+    #: Locals that may be bound to one of the package's modules.
+    modules: set[str]
+    #: `from x import *`: every name is visible as itself.
+    star: bool
+    #: Lines the import statements take.
+    lines: set[int]
+
+
+def _py_imports(text: str, top: str) -> _PyImports | None:
+    """What a file imports from the package whose top-level module is
+    ``top``; None for nothing."""
+    found = _PyImports({}, set(), False, set())
+    for match in _PY_FROM.finditer(text):
+        if match["module"].split(".")[0] != top:
+            continue
+        found.lines |= _span_lines(text, match.start(), match.end())
+        for part in match["names"].strip("()").split(","):
+            name, _, alias = part.strip().partition(" as ")
+            name, local = name.strip(), alias.strip() or name.strip()
+            if name == "*":
+                found.star = True
+            elif name.isidentifier() and local.isidentifier():
+                found.named[local] = name
+                # `from x import sub`: sub may be a module.
+                found.modules.add(local)
+    for match in _PY_IMPORT.finditer(text):
+        for part in match["names"].split(","):
+            name, _, alias = part.strip().partition(" as ")
+            if name.strip().split(".")[0] != top:
+                continue
+            found.lines |= _span_lines(text, match.start(), match.end())
+            found.modules.add(alias.strip() or top)
+    return found if found.lines else None
+
+
+def _py_patterns(symbol: ApiSymbol, imports: _PyImports) -> list[str]:
+    owner, member = symbol.owner, symbol.member
+    names = [_word(local) for local, name in imports.named.items() if name == owner]
+    if imports.star:
+        names.append(_word(owner))
+    names += [_word(local) + _PY_CHAIN + _word(owner) for local in imports.modules]
+    if member is None:
+        if symbol.kind in _CONSTRUCTOR_KINDS:
+            return [name + r"\s*\(" for name in names]
+        return names
+    patterns = [name + r"\s*\.\s*" + _word(member) for name in names]
+    if names and _distinctive(member):
+        # An instance of the owner: `session.mount`.
+        patterns.append(r"\.\s*" + _word(member))
+    return patterns
+
+
+def _py_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    by_top: dict[str, list[ApiSymbol]] = {}
+    for symbol in wanted:
+        by_top.setdefault(symbol.module.split(".")[0], []).append(symbol)
+    for path, text in files:
+        for top, symbols in by_top.items():
+            imports = _py_imports(text, top)
+            if imports is None:
+                continue
+            for symbol in symbols:
+                patterns = _py_patterns(symbol, imports)
+                yield from _hits(path, text, symbol, patterns, imports.lines)
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -374,8 +463,9 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm" or "maven" (no other has an API diff).
-        package: The package's name (npm files import it by name).
+        ecosystem: "npm", "maven" or "pypi" (no other has an API diff).
+        package: The package's name (npm files import it by name; Python
+            files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
         files: (path, text) of the repository's source files.
     """
@@ -385,6 +475,8 @@ def find_usages(
         return UsageReport()
     if ecosystem == "npm":
         found = _js_hits(mine, package, wanted)
+    elif ecosystem == "pypi":
+        found = _py_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

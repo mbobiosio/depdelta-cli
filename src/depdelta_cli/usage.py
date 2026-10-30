@@ -23,6 +23,10 @@
 #   Go        files that import the package (by its import path); the
 #             declaration named through the import (`yaml.Node`, or bare
 #             after a dot import), or one of its members.
+#   PHP       files that import the class or function (`use`, grouped or
+#             aliased), live in its namespace, or name it fully qualified;
+#             the declaration used (`new C(`, `C::member`), or one of its
+#             members (`->member`).
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -41,6 +45,7 @@ SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "maven": (".java", ".kt", ".kts"),
     "pypi": (".py",),
     "go": (".go",),
+    "composer": (".php",),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -88,8 +93,8 @@ class ApiSymbol:
     kind: str
     #: Dotted name as declared: `CLIEngine`, `Linter.verify`.
     name: str
-    #: The module (npm, PyPI), Java package (Maven) or package import path
-    #: (Go) it is declared in.
+    #: The module (npm, PyPI), Java package (Maven), package import path
+    #: (Go) or namespace (PHP, `\` for the global one) it is declared in.
     module: str
     change: UsageChange
 
@@ -534,6 +539,110 @@ def _go_hits(
                 )
 
 
+# ── PHP ──────────────────────────────────────────────────────────────────────
+
+_PHP_NAMESPACE = re.compile(r"^[ \t]*namespace[ \t]+([\w\\]+)[ \t]*[;{]", re.MULTILINE)
+_PHP_USE = re.compile(
+    r"^[ \t]*use[ \t]+(?:(?P<what>function|const)[ \t]+)?"
+    r"(?P<body>[\w\\\s,{}]+?)[ \t]*;",
+    re.MULTILINE,
+)
+_PHP_ITEM = re.compile(
+    r"^(?:(?P<what>function|const)\s+)?(?P<name>[\w\\]+)(?:\s+as\s+(?P<alias>\w+))?$"
+)
+#: Not a declaration's own name: `$x`, `->x`, `::x`, `\Ns\x`, `fx`.
+_PHP_BARE = r"(?<![\w$>:\\])"
+
+
+@dataclass
+class _PhpImports:
+    #: Local name → the fully qualified name it imports, per kind of import
+    #: ("" for classes and namespaces, "function", "const").
+    names: dict[tuple[str, str], str]
+    #: Namespaces the file declares itself in.
+    namespaces: set[str]
+    lines: set[int]
+
+
+def _php_imports(text: str) -> _PhpImports:
+    found = _PhpImports({}, set(), set())
+    found.namespaces = {m.group(1).strip("\\") for m in _PHP_NAMESPACE.finditer(text)}
+    for match in _PHP_USE.finditer(text):
+        body = " ".join(match["body"].split())
+        prefix, _, group = body.partition("{")
+        items = group.rstrip("} ").split(",") if group else body.split(",")
+        prefix = prefix.strip().strip("\\") if group else ""
+        found.lines |= _span_lines(text, match.start(), match.end())
+        for item in items:
+            parsed = _PHP_ITEM.match(item.strip())
+            if parsed is None:
+                continue
+            name = parsed["name"].strip("\\")
+            full = f"{prefix}\\{name}" if prefix else name
+            local = parsed["alias"] or full.rsplit("\\", 1)[-1]
+            what = parsed["what"] or match["what"] or ""
+            found.names[(what, local)] = full
+    return found
+
+
+def _php_names(symbol: ApiSymbol, imports: _PhpImports) -> list[str]:
+    """Patterns for how a file names the symbol's owner."""
+    module = "" if symbol.module == "\\" else symbol.module
+    full = f"{module}\\{symbol.owner}" if module else symbol.owner
+    # A function or constant of the namespace, not a class's member.
+    plain = "." not in symbol.name
+    what = symbol.kind if plain and symbol.kind in ("function", "const") else ""
+    # Fully qualified, in code or (no `\` first) in its `use` line; a global
+    # name is qualified only with it.
+    leading = r"\\?" if module else r"\\"
+    names = [r"(?<![\w\\])" + leading + re.escape(full) + r"(?![\w\\])"]
+    for (kind, local), imported in imports.names.items():
+        if kind == what and imported == full:
+            names.append(_PHP_BARE + re.escape(local) + r"(?![\w\\])")
+        elif kind == "" and full.startswith(imported + "\\"):
+            # A namespace imported: `use Monolog\Handler;` … `Handler\StreamHandler`.
+            rest = full[len(imported) :]
+            names.append(_PHP_BARE + re.escape(local + rest) + r"(?![\w\\])")
+    # Its own namespace sees it bare; a global function from anywhere.
+    if (
+        module in imports.namespaces
+        or (not module and not imports.namespaces)
+        or (not module and what == "function" and _distinctive(symbol.owner))
+    ):
+        names.append(_PHP_BARE + re.escape(symbol.owner) + r"(?![\w\\])")
+    return names
+
+
+def _php_patterns(symbol: ApiSymbol, imports: _PhpImports, text: str) -> list[str]:
+    # A file that never names the owner (imports included) is left alone:
+    # `->member` alone could be anything's.
+    names = [name for name in _php_names(symbol, imports) if re.search(name, text)]
+    # Every dotted PHP name is a class's member (`Logger.DEBUG` a constant).
+    member = symbol.name.rsplit(".", 1)[1] if "." in symbol.name else None
+    if member is None:
+        if symbol.kind in _CONSTRUCTOR_KINDS:
+            return [r"\bnew\s+" + name for name in names]
+        if symbol.kind == "function":
+            return [name + r"\s*\(" for name in names]
+        return names
+    word = r"\$?" + re.escape(member) + r"(?![\w$])"
+    patterns = [name + r"\s*::\s*" + word for name in names]
+    if names and _distinctive(member):
+        # An instance's member, or an inherited one (`static::`, `parent::`).
+        patterns.append(r"(?:\??->|::)\s*" + word)
+    return patterns
+
+
+def _php_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    for path, text in files:
+        imports = _php_imports(text)
+        for symbol in wanted:
+            patterns = _php_patterns(symbol, imports, text)
+            yield from _hits(path, text, symbol, patterns, imports.lines)
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -543,7 +652,8 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm", "maven", "pypi" or "go" (no other has an API diff).
+        ecosystem: "npm", "maven", "pypi", "go" or "composer" (no other has
+            an API diff).
         package: The package's name (npm files import it by name; Python
             files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
@@ -559,6 +669,8 @@ def find_usages(
         found = _py_hits(mine, wanted)
     elif ecosystem == "go":
         found = _go_hits(mine, wanted)
+    elif ecosystem == "composer":
+        found = _php_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

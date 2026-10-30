@@ -481,3 +481,109 @@ def test_find_usages_go_other_packages_ignored():
     report = find_usages("go", REDIS, GO, [("main.go", text)])
 
     assert report.total == 0
+
+
+MONOLOG = [
+    ApiSymbol("method", "Logger.pushHandler", "Monolog", "changed"),
+    ApiSymbol("constructor", "StreamHandler", "Monolog\\Handler", "changed"),
+    ApiSymbol("member", "Level.Debug", "Monolog", "removed"),
+    ApiSymbol("const", "Logger.DEBUG", "Monolog", "removed"),
+    ApiSymbol("property", "Logger.timezone", "Monolog", "removed"),
+    ApiSymbol("class", "Utils", "Monolog", "removed"),
+    ApiSymbol("function", "jsonEncode", "Monolog\\Utils", "removed"),
+    ApiSymbol("const", "VERSION", "Monolog", "removed"),
+]
+
+
+def test_find_usages_php_success():
+    text = (
+        "<?php\n"
+        "namespace App;\n"
+        "\n"
+        "use Monolog\\{Logger, Level as L, function Utils\\nope};\n"
+        "use Monolog\\Handler;\n"
+        "use function Monolog\\Utils\\jsonEncode;\n"
+        "use const Monolog\\VERSION, Bad Name;\n"
+        "\n"
+        "$log = new Logger('x');\n"
+        "$log->pushHandler(new Handler\\StreamHandler('php://stderr'));\n"
+        "$l = L::Debug;\n"
+        "$x = Logger::DEBUG;\n"
+        "echo \\Monolog\\Utils::class;\n"
+        "jsonEncode([]);\n"
+        "echo VERSION, Logger::$timezone;\n"
+        "$other?->pushHandler(1);\n"
+    )
+
+    report = find_usages("composer", "monolog/monolog", MONOLOG, [("src/a.php", text)])
+
+    assert _hits(report) == [
+        ("src/a.php", 10, "Logger.pushHandler"),
+        ("src/a.php", 10, "StreamHandler"),
+        ("src/a.php", 11, "Level.Debug"),
+        ("src/a.php", 12, "Logger.DEBUG"),
+        ("src/a.php", 13, "Utils"),
+        ("src/a.php", 14, "jsonEncode"),
+        ("src/a.php", 15, "Logger.timezone"),
+        ("src/a.php", 15, "VERSION"),
+        ("src/a.php", 16, "Logger.pushHandler"),
+    ]
+
+
+def test_find_usages_php_same_namespace_and_fully_qualified():
+    same = "<?php\nnamespace Monolog;\n$u = new Utils();\n"
+    qualified = "<?php\n$h = new \\Monolog\\Handler\\StreamHandler('x');\n"
+
+    report = find_usages(
+        "composer",
+        "monolog/monolog",
+        MONOLOG,
+        [("same.php", same), ("qualified.php", qualified)],
+    )
+
+    assert _hits(report) == [
+        ("qualified.php", 2, "StreamHandler"),
+        ("same.php", 3, "Utils"),
+    ]
+
+
+def test_find_usages_php_global_namespace():
+    wanted = [
+        ApiSymbol("class", "Parsedown", "\\", "removed"),
+        ApiSymbol("function", "dump_value", "\\", "removed"),
+        ApiSymbol("function", "e", "\\", "removed"),
+    ]
+    plain = "<?php\n$p = new Parsedown();\n"
+    namespaced = (
+        "<?php\nnamespace App;\ndump_value(1);\ne('x');\n$p = new Parsedown();\n"
+    )
+
+    report = find_usages(
+        "composer",
+        "erusev/parsedown",
+        wanted,
+        [("plain.php", plain), ("app.php", namespaced)],
+    )
+
+    # A global function is seen from any namespace; a global class isn't
+    # (App\Parsedown), and a short function name is too common to look for.
+    assert _hits(report) == [
+        ("app.php", 3, "dump_value"),
+        ("plain.php", 2, "Parsedown"),
+    ]
+
+
+def test_find_usages_php_import_line_when_never_used():
+    text = "<?php\nuse Monolog\\Utils;\n"
+
+    report = find_usages("composer", "monolog/monolog", MONOLOG, [("a.php", text)])
+
+    assert _hits(report) == [("a.php", 2, "Utils")]
+
+
+def test_find_usages_php_member_needs_its_owner():
+    text = "<?php\n$log->pushHandler($h);\n$x = $y::DEBUG;\n"
+
+    report = find_usages("composer", "monolog/monolog", MONOLOG, [("a.php", text)])
+
+    assert report.total == 0

@@ -26,8 +26,8 @@ On every change that touches a manifest or lockfile, `depdelta`:
 
 1. sends the changed manifests and lockfiles (both ends) to DepDelta. Source
    code is never sent;
-2. gets back each update's verdict and, for npm, Maven, PyPI and Go, the
-   declarations it removes or changes;
+2. gets back each update's verdict and, for npm, Maven, PyPI, Go and
+   Composer, the declarations it removes or changes;
 3. looks for those declarations in the checkout, and sends only the hits
    (path, line, symbol);
 4. posts the review: a Gerrit change message (no vote), or one GitLab merge

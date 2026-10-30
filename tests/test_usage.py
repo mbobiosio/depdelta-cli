@@ -756,3 +756,74 @@ def test_find_usages_dart_other_libraries_ignored():
     report = find_usages("pub", "http", DART, [("a.dart", text)])
 
     assert report.total == 0
+
+
+RACK = [
+    ApiSymbol("class", "Server", "Rack", "removed"),
+    ApiSymbol("constructor", "Request", "Rack", "changed"),
+    ApiSymbol("method", "Utils.escape", "Rack", "changed"),
+    ApiSymbol("method", "Request.params", "Rack", "changed"),
+    ApiSymbol("const", "Utils.DEFAULT_SEP", "Rack", "removed"),
+    ApiSymbol("const", "Rack.VERSION", "::", "removed"),
+    ApiSymbol("class", "Basic", "Rack::Auth", "removed"),
+]
+
+
+def test_find_usages_ruby_success():
+    text = (
+        "require 'rack'\n"
+        "server = Rack::Server.new\n"
+        "req = ::Rack::Request.new(env)\n"
+        "Rack::Utils.escape(s)\n"
+        "req.params\n"
+        "sep = Rack::Utils::DEFAULT_SEP\n"
+        "puts Rack::VERSION\n"
+        "Rack::Auth::Basic\n"
+        "Other::Server.new\n"
+    )
+
+    report = find_usages("rubygems", "rack", RACK, [("app/main.rb", text)])
+
+    assert _hits(report) == [
+        ("app/main.rb", 2, "Server"),
+        ("app/main.rb", 3, "Request"),
+        ("app/main.rb", 4, "Utils.escape"),
+        ("app/main.rb", 5, "Request.params"),
+        ("app/main.rb", 6, "Utils.DEFAULT_SEP"),
+        ("app/main.rb", 7, "Rack.VERSION"),
+        ("app/main.rb", 8, "Basic"),
+    ]
+
+
+def test_find_usages_ruby_inside_the_namespace():
+    text = (
+        "module Rack\n"
+        "  class Mine < Server\n"
+        "    include Utils\n"
+        "    def call(env) = Request.new(env).params\n"
+        "    def sep = DEFAULT_SEP\n"
+        "    def auth = Auth::Basic\n"
+        "    def esc(s) = Utils::escape(s)\n"
+        "  end\n"
+        "end\n"
+    )
+
+    report = find_usages("rubygems", "rack", RACK, [("lib/mine.rb", text)])
+
+    assert _hits(report) == [
+        ("lib/mine.rb", 2, "Server"),
+        ("lib/mine.rb", 4, "Request"),
+        ("lib/mine.rb", 4, "Request.params"),
+        ("lib/mine.rb", 5, "Utils.DEFAULT_SEP"),
+        ("lib/mine.rb", 6, "Basic"),
+        ("lib/mine.rb", 7, "Utils.escape"),
+    ]
+
+
+def test_find_usages_ruby_member_needs_its_owner():
+    text = "run lambda { |env| [200, {}, [env.params]] }\nServer.new\n"
+
+    report = find_usages("rubygems", "rack", RACK, [("config.ru", text)])
+
+    # Neither Rack's namespace nor Request is named: nothing is Rack's.
+    assert report.total == 0

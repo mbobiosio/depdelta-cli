@@ -35,6 +35,11 @@
 #   Dart      files that import the library (`package:x/y.dart`), honouring
 #             `as`, `show` and `hide`; the declaration used, a function
 #             called, a named constructor, or one of its members.
+#   Ruby      any file (constants are global, no require needed); the
+#             declaration named in full (`Rack::Request`) or from a namespace
+#             the file is in or includes (`Request` in `module Rack`), its
+#             constructor (`.new`) or one of its members (an instance's when
+#             the file names the class and the member's name is distinctive).
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -60,6 +65,7 @@ SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "composer": (".php",),
     "nuget": (".cs",),
     "pub": (".dart",),
+    "rubygems": (".rb", ".rake", ".ru"),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -825,6 +831,66 @@ def _dart_hits(
                 yield from _hits(path, text, symbol, patterns, lines)
 
 
+# ── Ruby ─────────────────────────────────────────────────────────────────────
+
+_RB_SCOPE = re.compile(
+    r"^[ \t]*(?:module|class|include|extend)[ \t]+(?:::)?([A-Z]\w*(?:::[A-Z]\w*)*)",
+    re.MULTILINE,
+)
+
+
+def _rb_scopes(text: str) -> set[str]:
+    """The namespaces a file's code is in or includes, in full and by each
+    name (`module Rack::Auth` → Rack::Auth, Rack, Auth)."""
+    found: set[str] = set()
+    for match in _RB_SCOPE.finditer(text):
+        parts = match.group(1).split("::")
+        found.update("::".join(parts[: i + 1]) for i in range(len(parts)))
+        found.update(parts)
+    return found
+
+
+def _rb_names(segments: list[str], scopes: set[str]) -> list[str]:
+    """Patterns for the constant at ``segments`` as a file can write it: in
+    full, or from a namespace it is in (`Request` inside `module Rack`)."""
+    names: list[str] = []
+    for start in range(len(segments)):
+        prefix = segments[:start]
+        if prefix and prefix[-1] not in scopes and "::".join(prefix) not in scopes:
+            continue
+        written = r"\s*::\s*".join(re.escape(part) for part in segments[start:])
+        lead = r"(?<![\w:])" + (r"(?:::)?" if not start else "")
+        names.append(lead + written + r"(?![\w?!])")
+    return names
+
+
+def _rb_patterns(symbol: ApiSymbol, scopes: set[str], text: str) -> list[str]:
+    namespace = [part for part in symbol.module.split("::") if part]
+    member = symbol.member
+    if member is None and symbol.kind not in _CONSTRUCTOR_KINDS:
+        # A class, module or constant: `const Utils.SEP` is Utils::SEP.
+        return _rb_names(namespace + symbol.name.split("."), scopes)
+    names = _rb_names([*namespace, symbol.owner], scopes)
+    if member is None:
+        return [name + r"\s*\.\s*new\b" for name in names]
+    patterns = [name + r"\s*(?:\.|::)\s*" + _word(member) for name in names]
+    if _distinctive(member) and any(re.search(name, text) for name in names):
+        # An instance of a class the file names: `request.params`.
+        patterns.append(r"\.\s*" + _word(member))
+    return patterns
+
+
+def _rb_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    for path, text in files:
+        scopes = _rb_scopes(text)
+        for symbol in wanted:
+            # Ruby constants are global: no require is needed to use one.
+            patterns = _rb_patterns(symbol, scopes, text)
+            yield from _hits(path, text, symbol, patterns, set())
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -834,8 +900,8 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm", "maven", "pypi", "go", "composer", "nuget" or "pub"
-            (no other has an API diff).
+        ecosystem: "npm", "maven", "pypi", "go", "composer", "nuget", "pub"
+            or "rubygems" (no other has an API diff).
         package: The package's name (npm files import it by name; Python
             files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
@@ -857,6 +923,8 @@ def find_usages(
         found = _cs_hits(mine, wanted)
     elif ecosystem == "pub":
         found = _dart_hits(mine, wanted)
+    elif ecosystem == "rubygems":
+        found = _rb_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

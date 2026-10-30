@@ -27,6 +27,11 @@
 #             aliased), live in its namespace, or name it fully qualified;
 #             the declaration used (`new C(`, `C::member`), or one of its
 #             members (`->member`).
+#   C#        files that see the namespace (a `using`, a global one in any
+#             file, or living in it), alias or `using static` the type, or
+#             name it fully qualified; the type, its constructor or its
+#             members used (an instance's or an extension method's when the
+#             member's name is distinctive).
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -46,6 +51,7 @@ SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "pypi": (".py",),
     "go": (".go",),
     "composer": (".php",),
+    "nuget": (".cs",),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -94,7 +100,8 @@ class ApiSymbol:
     #: Dotted name as declared: `CLIEngine`, `Linter.verify`.
     name: str
     #: The module (npm, PyPI), Java package (Maven), package import path
-    #: (Go) or namespace (PHP, `\` for the global one) it is declared in.
+    #: (Go) or namespace (PHP, `\` for the global one; .NET) it is declared
+    #: in.
     module: str
     change: UsageChange
 
@@ -643,6 +650,101 @@ def _php_hits(
             yield from _hits(path, text, symbol, patterns, imports.lines)
 
 
+# ── C# ───────────────────────────────────────────────────────────────────────
+
+_CS_NAMESPACE = re.compile(r"^[ \t]*namespace[ \t]+([\w.]+)", re.MULTILINE)
+_CS_USING = re.compile(
+    r"^[ \t]*(?P<global>global[ \t]+)?using[ \t]+(?:(?P<static>static)[ \t]+)?"
+    r"(?:(?P<alias>\w+)[ \t]*=[ \t]*)?(?:global::)?(?P<target>[\w.]+)[ \t]*;",
+    re.MULTILINE,
+)
+#: Kinds that are a type of their own, not a member of one.
+_CS_TYPE_KINDS = frozenset({"class", "struct", "interface", "enum", "delegate"})
+
+
+@dataclass
+class _CsScope:
+    #: Namespaces imported, and those the file declares itself in.
+    namespaces: set[str]
+    declared: set[str]
+    #: Alias → the namespace or type it names.
+    aliases: dict[str, str]
+    #: Types whose static members are visible bare (`using static`).
+    statics: set[str]
+    lines: set[int]
+
+
+def _cs_scope(text: str, global_usings: list[re.Match[str]]) -> _CsScope:
+    found = _CsScope(set(), set(), {}, set(), set())
+    found.declared = {m.group(1) for m in _CS_NAMESPACE.finditer(text)}
+    for match in [*global_usings, *_CS_USING.finditer(text)]:
+        if match.string is text:
+            found.lines |= _span_lines(text, match.start(), match.end())
+        if match["alias"]:
+            found.aliases[match["alias"]] = match["target"]
+        elif match["static"]:
+            found.statics.add(match["target"])
+        else:
+            found.namespaces.add(match["target"])
+    return found
+
+
+def _dotted(name: str) -> str:
+    """``name`` as written in code, spaces allowed around its dots."""
+    return r"\s*\.\s*".join(re.escape(part) for part in name.split("."))
+
+
+def _cs_patterns(symbol: ApiSymbol, scope: _CsScope, text: str) -> list[str]:
+    if symbol.kind in _CS_TYPE_KINDS or symbol.kind in _CONSTRUCTOR_KINDS:
+        owner, member = symbol.name, None
+    else:
+        owner, _, member = symbol.name.rpartition(".")
+    full = f"{symbol.module}.{owner}"
+    bare = r"(?<![\w.])"
+    names = [bare + r"(?:global::)?" + _dotted(full) + r"(?!\w)"]
+    in_scope = symbol.module in scope.namespaces or any(
+        own == symbol.module or own.startswith(symbol.module + ".")
+        for own in scope.declared
+    )
+    if in_scope:
+        names.append(bare + _dotted(owner) + r"(?!\w)")
+    for alias, target in scope.aliases.items():
+        if target == full:
+            names.append(_word(alias))
+        elif full.startswith(target + "."):
+            names.append(bare + _dotted(alias + full[len(target) :]) + r"(?!\w)")
+    # A file that never names the type nor sees its namespace is left alone.
+    names = [name for name in names if re.search(name, text)]
+    if member is None:
+        if symbol.kind in _CONSTRUCTOR_KINDS:
+            return [r"\bnew\s+" + name + r"\s*(?:<[^<>()]*>)?\s*\(" for name in names]
+        return names
+    patterns = [name + r"\s*\.\s*" + _word(member) for name in names]
+    if full in scope.statics:
+        patterns.append(bare + re.escape(member) + r"(?!\w)")
+    if (names or in_scope) and _distinctive(member):
+        # An instance's member, or an extension method.
+        patterns.append(r"\.\s*" + _word(member))
+    return patterns
+
+
+def _cs_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    # `global using` in one file counts in every file of the project.
+    global_usings = [
+        match
+        for _, text in files
+        for match in _CS_USING.finditer(text)
+        if match["global"]
+    ]
+    for path, text in files:
+        scope = _cs_scope(text, global_usings)
+        for symbol in wanted:
+            patterns = _cs_patterns(symbol, scope, text)
+            yield from _hits(path, text, symbol, patterns, scope.lines)
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -652,8 +754,8 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm", "maven", "pypi", "go" or "composer" (no other has
-            an API diff).
+        ecosystem: "npm", "maven", "pypi", "go", "composer" or "nuget" (no
+            other has an API diff).
         package: The package's name (npm files import it by name; Python
             files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
@@ -671,6 +773,8 @@ def find_usages(
         found = _go_hits(mine, wanted)
     elif ecosystem == "composer":
         found = _php_hits(mine, wanted)
+    elif ecosystem == "nuget":
+        found = _cs_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

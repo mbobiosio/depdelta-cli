@@ -587,3 +587,106 @@ def test_find_usages_php_member_needs_its_owner():
     report = find_usages("composer", "monolog/monolog", MONOLOG, [("a.php", text)])
 
     assert report.total == 0
+
+
+NEWTONSOFT = [
+    ApiSymbol("method", "JsonConvert.SerializeObject", "Newtonsoft.Json", "changed"),
+    ApiSymbol("ctor", "JsonSerializer", "Newtonsoft.Json", "changed"),
+    ApiSymbol("class", "JsonTextReader", "Newtonsoft.Json", "removed"),
+    ApiSymbol("property", "JsonReader.DateFormatString", "Newtonsoft.Json", "removed"),
+    ApiSymbol("const", "JsonConvert.True", "Newtonsoft.Json", "removed"),
+    ApiSymbol("class", "Outer.Inner", "Newtonsoft.Json.Linq", "removed"),
+    ApiSymbol("method", "Extensions.Value", "Newtonsoft.Json.Linq", "removed"),
+]
+
+
+def test_find_usages_csharp_success():
+    text = (
+        "using System;\n"
+        "using Newtonsoft.Json;\n"
+        "using using_var_is_not_an_import = 1\n"
+        "\n"
+        "class A {\n"
+        "  string s = JsonConvert.SerializeObject(x);\n"
+        "  var ser = new JsonSerializer();\n"
+        "  var r = new JsonTextReader(t);\n"
+        '  reader.DateFormatString = "x";\n'
+        "  var t = JsonConvert.True;\n"
+        "}\n"
+    )
+
+    report = find_usages("nuget", "Newtonsoft.Json", NEWTONSOFT, [("A.cs", text)])
+
+    assert _hits(report) == [
+        ("A.cs", 6, "JsonConvert.SerializeObject"),
+        ("A.cs", 7, "JsonSerializer"),
+        ("A.cs", 8, "JsonTextReader"),
+        ("A.cs", 9, "JsonReader.DateFormatString"),
+        ("A.cs", 10, "JsonConvert.True"),
+    ]
+
+
+def test_find_usages_csharp_aliases_statics_and_qualified():
+    text = (
+        "using J = Newtonsoft.Json.JsonConvert;\n"
+        "using NJ = Newtonsoft.Json;\n"
+        "using static Newtonsoft.Json.JsonConvert;\n"
+        "\n"
+        "var a = J.SerializeObject(1);\n"
+        "var b = new NJ.JsonSerializer();\n"
+        "var c = SerializeObject(2);\n"
+        "var d = new global::Newtonsoft.Json.JsonTextReader(t);\n"
+        "var e = Newtonsoft.Json.Linq.Outer.Inner.Make();\n"
+    )
+
+    report = find_usages("nuget", "Newtonsoft.Json", NEWTONSOFT, [("B.cs", text)])
+
+    assert _hits(report) == [
+        ("B.cs", 5, "JsonConvert.SerializeObject"),
+        ("B.cs", 6, "JsonSerializer"),
+        ("B.cs", 7, "JsonConvert.SerializeObject"),
+        ("B.cs", 8, "JsonTextReader"),
+        ("B.cs", 9, "Outer.Inner"),
+    ]
+
+
+def test_find_usages_csharp_global_using_and_own_namespace():
+    usings = "global using Newtonsoft.Json.Linq;\n"
+    extension = 'class C {\n  var v = token.Value<int>("a");\n}\n'
+    inside = (
+        "namespace Newtonsoft.Json.Tests;\nvar s = JsonConvert.SerializeObject(1);\n"
+    )
+
+    report = find_usages(
+        "nuget",
+        "Newtonsoft.Json",
+        NEWTONSOFT,
+        [("Usings.cs", usings), ("C.cs", extension), ("T.cs", inside)],
+    )
+
+    # A global using makes extension methods visible; a child namespace
+    # sees its parents' types.
+    assert _hits(report) == [
+        ("C.cs", 2, "Extensions.Value"),
+        ("T.cs", 2, "JsonConvert.SerializeObject"),
+    ]
+
+
+def test_find_usages_csharp_import_line_when_never_used():
+    text = "using JT = Newtonsoft.Json.JsonTextReader;\n"
+
+    report = find_usages("nuget", "Newtonsoft.Json", NEWTONSOFT, [("D.cs", text)])
+
+    assert _hits(report) == [("D.cs", 1, "JsonTextReader")]
+
+
+def test_find_usages_csharp_other_namespaces_ignored():
+    text = (
+        "using System.Text.Json;\n"
+        "var s = JsonSerializer.Serialize(x);\n"
+        "r.DateFormatString = 1;\n"
+    )
+
+    report = find_usages("nuget", "Newtonsoft.Json", NEWTONSOFT, [("E.cs", text)])
+
+    assert report.total == 0

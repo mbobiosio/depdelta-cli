@@ -3,8 +3,16 @@
 # The matcher's tests, as depdelta-api's (tests/unit/updates/test_usage.py)
 # for the same code.
 
+import pytest
+
 from depdelta_cli import usage as module
-from depdelta_cli.usage import ApiSymbol, UsageHit, UsageReport, find_usages
+from depdelta_cli.usage import (
+    ApiSymbol,
+    UsageHit,
+    UsageReport,
+    find_usages,
+    go_package_name,
+)
 
 
 def _hits(report: UsageReport) -> list[tuple[str, int, str]]:
@@ -377,5 +385,99 @@ def test_find_usages_python_other_packages_ignored():
     text = "import os\nfrom json import dump\ndump({})\n"
 
     report = find_usages("pypi", "pyyaml", REQUESTS, [("tool.py", text)])
+
+    assert report.total == 0
+
+
+REDIS = "github.com/redis/go-redis/v9"
+GO = [
+    ApiSymbol("method", "Client.Pipelined", REDIS, "changed"),
+    ApiSymbol("func", "NewClient", REDIS, "changed"),
+    ApiSymbol("type", "Options", REDIS, "removed"),
+    ApiSymbol("field", "Options.Dialer", REDIS, "removed"),
+    ApiSymbol("method", "Cmd.Err", REDIS, "changed"),
+    ApiSymbol("type", "Node", "gopkg.in/yaml.v3", "changed"),
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "name"),
+    [
+        ("github.com/redis/go-redis/v9", "redis"),
+        ("gopkg.in/yaml.v3", "yaml"),
+        ("github.com/hashicorp/golang-lru", "lru"),
+        ("github.com/nats-io/nats.go", "nats"),
+        ("github.com/segmentio/kafka-go", "kafka"),
+        ("github.com/go-chi/chi/v5/middleware", "middleware"),
+        ("github.com/spf13/cobra-cli", "cli"),
+        ("example.com", "example.com"),
+    ],
+)
+def test_go_package_name_success(path, name):
+    assert go_package_name(path) == name
+
+
+def test_find_usages_go_success():
+    text = (
+        "package app\n"
+        "\n"
+        "import (\n"
+        '\t"context"\n'
+        '\t"github.com/redis/go-redis/v9"\n'
+        '\ty "gopkg.in/yaml.v3"\n'
+        ")\n"
+        "\n"
+        "func run(ctx context.Context) {\n"
+        "\tc := redis.NewClient(&redis.Options{})\n"
+        "\tc.Pipelined(ctx, nil)\n"
+        "\tvar n y.Node\n"
+        '\t_ = redis.Options{Addr: "x"}.Dialer\n'
+        "\tc.Ping(ctx).Err()\n"
+        "}\n"
+    )
+
+    report = find_usages("go", REDIS, GO, [("app/run.go", text)])
+
+    assert _hits(report) == [
+        ("app/run.go", 10, "NewClient"),
+        ("app/run.go", 10, "Options"),
+        ("app/run.go", 11, "Client.Pipelined"),
+        ("app/run.go", 12, "Node"),
+        ("app/run.go", 13, "Options"),
+        ("app/run.go", 13, "Options.Dialer"),
+    ]
+
+
+def test_find_usages_go_single_alias_and_dot_imports():
+    text = (
+        'import r "github.com/redis/go-redis/v9"\n'
+        'import . "gopkg.in/yaml.v3"\n'
+        "var o = r.Options{}\n"
+        "var n Node\n"
+    )
+
+    report = find_usages("go", REDIS, GO, [("main.go", text)])
+
+    assert _hits(report) == [("main.go", 3, "Options"), ("main.go", 4, "Node")]
+
+
+def test_find_usages_go_blank_import_and_import_line_ignored():
+    text = (
+        'import _ "github.com/redis/go-redis/v9"\n'
+        'import "gopkg.in/yaml.v3"\n'
+        "var x = 1\n"
+    )
+
+    report = find_usages("go", REDIS, GO, [("main.go", text)])
+
+    # A blank import uses nothing; a package imported but unused uses
+    # nothing either (and doesn't compile).
+    assert report.total == 0
+
+
+def test_find_usages_go_other_packages_ignored():
+    text = 'import "github.com/other/redis"\nvar o = redis.Options{}\n'
+
+    report = find_usages("go", REDIS, GO, [("main.go", text)])
 
     assert report.total == 0

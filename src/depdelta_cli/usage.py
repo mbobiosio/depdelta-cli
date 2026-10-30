@@ -20,6 +20,9 @@
 #             `from x.sub import Y`); what they import used as the removed or
 #             changed declaration, or reached through an imported module
 #             (`x.sub.Y`), or one of its members.
+#   Go        files that import the package (by its import path); the
+#             declaration named through the import (`yaml.Node`, or bare
+#             after a dot import), or one of its members.
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -37,6 +40,7 @@ SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "npm": (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
     "maven": (".java", ".kt", ".kts"),
     "pypi": (".py",),
+    "go": (".go",),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -84,7 +88,8 @@ class ApiSymbol:
     kind: str
     #: Dotted name as declared: `CLIEngine`, `Linter.verify`.
     name: str
-    #: The module (npm, PyPI) or Java package (Maven) it is declared in.
+    #: The module (npm, PyPI), Java package (Maven) or package import path
+    #: (Go) it is declared in.
     module: str
     change: UsageChange
 
@@ -134,6 +139,21 @@ def _word(name: str) -> str:
 
 def _distinctive(member: str) -> bool:
     return len(member) >= 4 and member not in _COMMON_MEMBERS
+
+
+def _owner_patterns(symbol: ApiSymbol, names: list[str]) -> list[str]:
+    """Patterns for ``symbol`` where ``names`` are the patterns for its
+    owner as a file names it (Python, Go)."""
+    member = symbol.member
+    if member is None:
+        if symbol.kind in _CONSTRUCTOR_KINDS:
+            return [name + r"\s*\(" for name in names]
+        return names
+    patterns = [name + r"\s*\.\s*" + _word(member) for name in names]
+    if names and _distinctive(member):
+        # An instance of the owner: `session.mount`.
+        patterns.append(r"\.\s*" + _word(member))
+    return patterns
 
 
 def _hits(
@@ -422,20 +442,12 @@ def _py_imports(text: str, top: str) -> _PyImports | None:
 
 
 def _py_patterns(symbol: ApiSymbol, imports: _PyImports) -> list[str]:
-    owner, member = symbol.owner, symbol.member
+    owner = symbol.owner
     names = [_word(local) for local, name in imports.named.items() if name == owner]
     if imports.star:
         names.append(_word(owner))
     names += [_word(local) + _PY_CHAIN + _word(owner) for local in imports.modules]
-    if member is None:
-        if symbol.kind in _CONSTRUCTOR_KINDS:
-            return [name + r"\s*\(" for name in names]
-        return names
-    patterns = [name + r"\s*\.\s*" + _word(member) for name in names]
-    if names and _distinctive(member):
-        # An instance of the owner: `session.mount`.
-        patterns.append(r"\.\s*" + _word(member))
-    return patterns
+    return _owner_patterns(symbol, names)
 
 
 def _py_hits(
@@ -454,6 +466,74 @@ def _py_hits(
                 yield from _hits(path, text, symbol, patterns, imports.lines)
 
 
+# ── Go ───────────────────────────────────────────────────────────────────────
+
+_GO_IMPORT = re.compile(
+    r"^[ \t]*import[ \t]*(?:\((?P<group>[^)]*)\)|(?P<one>[^\n]*))", re.MULTILINE
+)
+_GO_SPEC = re.compile(r'(?:(?P<local>[A-Za-z_]\w*|\.)[ \t]+)?"(?P<path>[^"\n]+)"')
+_GO_MAJOR = re.compile(r"^v\d+$")
+_GO_AFFIXES = re.compile(r"\.v\d+$|^(?:go|golang)-|[-.]go$")
+
+
+def go_package_name(path: str) -> str:
+    """The name a package is used by when its import gives none, guessed
+    from its path (its source says, and the surface keeps only paths):
+    `gopkg.in/yaml.v3` → yaml, `github.com/redis/go-redis/v9` → redis."""
+    parts = path.split("/")
+    last = parts[-2] if len(parts) > 1 and _GO_MAJOR.match(parts[-1]) else parts[-1]
+    return _GO_AFFIXES.sub("", last).rsplit("-", 1)[-1]
+
+
+@dataclass
+class _GoImports:
+    #: Names the file uses the package by.
+    names: set[str]
+    #: `import . "path"`: its declarations are used bare.
+    dot: bool
+
+
+def _go_imports(text: str, package: str) -> _GoImports | None:
+    """How a file imports the package at import path ``package``; None when
+    it doesn't (`import _` only runs its init)."""
+    found = _GoImports(set(), False)
+    for match in _GO_IMPORT.finditer(text):
+        for spec in _GO_SPEC.finditer(match["group"] or match["one"]):
+            local = spec["local"]
+            if spec["path"] != package or local == "_":
+                continue
+            if local == ".":
+                found.dot = True
+            else:
+                found.names.add(local or go_package_name(package))
+    return found if found.names or found.dot else None
+
+
+def _go_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    by_package: dict[str, list[ApiSymbol]] = {}
+    for symbol in wanted:
+        by_package.setdefault(symbol.module, []).append(symbol)
+    for path, text in files:
+        for package, symbols in by_package.items():
+            imports = _go_imports(text, package)
+            if imports is None:
+                continue
+            for symbol in symbols:
+                names = [
+                    _word(name) + r"\s*\.\s*" + _word(symbol.owner)
+                    for name in sorted(imports.names)
+                ]
+                if imports.dot:
+                    names.append(_word(symbol.owner))
+                # Go imports packages, not declarations: an import line is
+                # never a hit of its own.
+                yield from _hits(
+                    path, text, symbol, _owner_patterns(symbol, names), set()
+                )
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -463,7 +543,7 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm", "maven" or "pypi" (no other has an API diff).
+        ecosystem: "npm", "maven", "pypi" or "go" (no other has an API diff).
         package: The package's name (npm files import it by name; Python
             files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
@@ -477,6 +557,8 @@ def find_usages(
         found = _js_hits(mine, package, wanted)
     elif ecosystem == "pypi":
         found = _py_hits(mine, wanted)
+    elif ecosystem == "go":
+        found = _go_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

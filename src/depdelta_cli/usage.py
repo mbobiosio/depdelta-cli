@@ -32,6 +32,9 @@
 #             name it fully qualified; the type, its constructor or its
 #             members used (an instance's or an extension method's when the
 #             member's name is distinctive).
+#   Dart      files that import the library (`package:x/y.dart`), honouring
+#             `as`, `show` and `hide`; the declaration used, a function
+#             called, a named constructor, or one of its members.
 # A file that imports a removed declaration but never uses it beyond the
 # import still breaks the build: then the import line is the hit.
 
@@ -45,6 +48,10 @@ MAX_HITS = 50
 
 UsageChange = Literal["removed", "changed"]
 
+#: `show A, B` / `hide C` after a Dart import (depdelta-api's
+#: app/apidiff/dart.py COMBINATOR).
+COMBINATOR = re.compile(r"\b(show|hide)\s+([\w$]+(?:\s*,\s*[\w$]+)*)")
+
 SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "npm": (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"),
     "maven": (".java", ".kt", ".kts"),
@@ -52,6 +59,7 @@ SOURCE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "go": (".go",),
     "composer": (".php",),
     "nuget": (".cs",),
+    "pub": (".dart",),
 }
 
 #: Kinds naming a member of the declaration before the last dot (`get` and
@@ -100,8 +108,8 @@ class ApiSymbol:
     #: Dotted name as declared: `CLIEngine`, `Linter.verify`.
     name: str
     #: The module (npm, PyPI), Java package (Maven), package import path
-    #: (Go) or namespace (PHP, `\` for the global one; .NET) it is declared
-    #: in.
+    #: (Go), namespace (PHP, `\` for the global one; .NET) or library URI
+    #: (Dart) it is declared in.
     module: str
     change: UsageChange
 
@@ -745,6 +753,78 @@ def _cs_hits(
             yield from _hits(path, text, symbol, patterns, scope.lines)
 
 
+# ── Dart ─────────────────────────────────────────────────────────────────────
+
+_DART_IMPORT = re.compile(
+    r"^[ \t]*import[ \t]+(?P<quote>['\"])(?P<uri>[^'\"\n]+)(?P=quote)(?P<rest>[^;]*);",
+    re.MULTILINE,
+)
+_DART_PREFIX = re.compile(r"\bas\s+([A-Za-z_$][\w$]*)")
+
+
+@dataclass
+class _DartImport:
+    #: `as p`: the library's names are used as `p.Name`.
+    prefix: str | None
+    #: `show A, B` (None: everything) and `hide C`.
+    shown: set[str] | None
+    hidden: set[str]
+
+
+def _dart_imports(text: str) -> tuple[dict[str, list[_DartImport]], set[int]]:
+    """Each imported library's imports, by URI, and the lines they take."""
+    found: dict[str, list[_DartImport]] = {}
+    lines: set[int] = set()
+    for match in _DART_IMPORT.finditer(text):
+        lines |= _span_lines(text, match.start(), match.end())
+        prefix = _DART_PREFIX.search(match["rest"])
+        shown: set[str] | None = None
+        hidden: set[str] = set()
+        for combinator, listed in COMBINATOR.findall(match["rest"]):
+            names = {name.strip() for name in listed.split(",")}
+            if combinator == "show":
+                shown = names
+            else:
+                hidden |= names
+        found.setdefault(match["uri"], []).append(
+            _DartImport(prefix.group(1) if prefix else None, shown, hidden)
+        )
+    return found, lines
+
+
+def _dart_patterns(symbol: ApiSymbol, imports: list[_DartImport]) -> list[str]:
+    owner = symbol.owner
+    names: list[str] = []
+    for imported in imports:
+        if owner in imported.hidden or (
+            imported.shown is not None and owner not in imported.shown
+        ):
+            continue
+        if imported.prefix:
+            names.append(_word(imported.prefix) + r"\s*\.\s*" + _word(owner))
+        else:
+            names.append(r"(?<![\w$.])" + re.escape(owner) + r"(?![\w$])")
+    call = r"\s*(?:<[^<>()]*>)?\s*\("
+    if symbol.kind in _CONSTRUCTOR_KINDS and "." in symbol.name:
+        named = symbol.name.split(".", 1)[1]
+        return [name + r"\s*\.\s*" + _word(named) + call for name in names]
+    if symbol.kind == "function":
+        # Called (`get(url)`), not a getter that shares its name.
+        return [name + call for name in names]
+    return _owner_patterns(symbol, names)
+
+
+def _dart_hits(
+    files: list[tuple[str, str]], wanted: list[ApiSymbol]
+) -> Iterator[UsageHit]:
+    for path, text in files:
+        imports, lines = _dart_imports(text)
+        for symbol in wanted:
+            if symbol.module in imports:
+                patterns = _dart_patterns(symbol, imports[symbol.module])
+                yield from _hits(path, text, symbol, patterns, lines)
+
+
 def find_usages(
     ecosystem: str,
     package: str,
@@ -754,8 +834,8 @@ def find_usages(
     """Where ``files`` appear to use ``wanted`` declarations of ``package``.
 
     Args:
-        ecosystem: "npm", "maven", "pypi", "go", "composer" or "nuget" (no
-            other has an API diff).
+        ecosystem: "npm", "maven", "pypi", "go", "composer", "nuget" or "pub"
+            (no other has an API diff).
         package: The package's name (npm files import it by name; Python
             files by its module's, which the symbols carry).
         wanted: The update's removed and changed declarations.
@@ -775,6 +855,8 @@ def find_usages(
         found = _php_hits(mine, wanted)
     elif ecosystem == "nuget":
         found = _cs_hits(mine, wanted)
+    elif ecosystem == "pub":
+        found = _dart_hits(mine, wanted)
     else:
         found = _jvm_hits(mine, wanted)
     hits = sorted(set(found), key=lambda h: (h.path, h.line, h.symbol))

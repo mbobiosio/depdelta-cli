@@ -690,3 +690,69 @@ def test_find_usages_csharp_other_namespaces_ignored():
     report = find_usages("nuget", "Newtonsoft.Json", NEWTONSOFT, [("E.cs", text)])
 
     assert report.total == 0
+
+
+HTTP = "package:http/http.dart"
+DART = [
+    ApiSymbol("function", "get", HTTP, "changed"),
+    ApiSymbol("class", "Client", HTTP, "changed"),
+    ApiSymbol("ctor", "Client.withTimeout", HTTP, "removed"),
+    ApiSymbol("ctor", "Request", HTTP, "changed"),
+    ApiSymbol("method", "Client.readBytes", HTTP, "changed"),
+    ApiSymbol("get", "StreamedRequest.sink", HTTP, "changed"),
+]
+
+
+def test_find_usages_dart_success():
+    text = (
+        "import 'package:http/http.dart' as http;\n"
+        "import 'dart:async';\n"
+        "\n"
+        "Future<void> main() async {\n"
+        "  final r = await http.get(Uri.parse('x'));\n"
+        "  final c = http.Client.withTimeout(d);\n"
+        "  final q = http.Request('GET', u);\n"
+        "  final b = await client.readBytes(u);\n"
+        "  int get count => 1;\n"
+        "}\n"
+    )
+
+    report = find_usages("pub", "http", DART, [("lib/main.dart", text)])
+
+    assert _hits(report) == [
+        ("lib/main.dart", 5, "get"),
+        ("lib/main.dart", 6, "Client"),
+        ("lib/main.dart", 6, "Client.withTimeout"),
+        ("lib/main.dart", 7, "Request"),
+        ("lib/main.dart", 8, "Client.readBytes"),
+    ]
+
+
+def test_find_usages_dart_show_and_hide():
+    text = (
+        "import 'package:http/http.dart' show Client hide Request;\n"
+        "final c = Client();\n"
+        "final r = Request('GET', u);\n"
+        "final g = get(u);\n"
+    )
+
+    report = find_usages("pub", "http", DART, [("a.dart", text)])
+
+    # Only what `show` lets in, less what `hide` keeps out.
+    assert _hits(report) == [("a.dart", 2, "Client")]
+
+
+def test_find_usages_dart_import_line_when_never_used():
+    text = "import 'package:http/http.dart' show Client;\n"
+
+    report = find_usages("pub", "http", DART, [("a.dart", text)])
+
+    assert _hits(report) == [("a.dart", 1, "Client")]
+
+
+def test_find_usages_dart_other_libraries_ignored():
+    text = "import 'package:dio/dio.dart';\nfinal r = get(u);\nfinal c = Client();\n"
+
+    report = find_usages("pub", "http", DART, [("a.dart", text)])
+
+    assert report.total == 0
